@@ -46,6 +46,22 @@ h1 {
   font-weight: 600;
 }
 
+
+.row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.input {
+  width: 100%;
+  border: 1px solid #4157ad;
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: #0e1635;
+  color: inherit;
+}
 .select {
   width: 100%;
   border: 1px solid #4157ad;
@@ -77,7 +93,8 @@ button:hover:enabled {
 }
 
 button:disabled,
-.select:disabled {
+.select:disabled,
+.input:disabled {
   opacity: 0.6;
   cursor: not-allowed;
 }

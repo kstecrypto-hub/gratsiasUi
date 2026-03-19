@@ -2,28 +2,54 @@ import React, { useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import './styles.css';
 
-const WEBHOOKS = {
+const WEBHOOK_PATHS = {
   production: {
-    email: 'http://localhost:49078/webhook/email',
-    sms: 'http://localhost:49078/webhook/sms',
+    email: 'webhook/email',
+    sms: 'webhook/sms',
   },
   test: {
-    email: 'http://localhost:49078/webhook-test/email',
-    sms: 'http://localhost:49078/webhook-test/sms',
+    email: 'webhook-test/email',
+    sms: 'webhook-test/sms',
   },
 };
 
+function joinUrl(base, path) {
+  const cleanedBase = base.replace(/\/+$/, '');
+  return `${cleanedBase}/${path}`;
+}
+
 function App() {
   const [environment, setEnvironment] = useState('production');
+  const [apiBaseUrl, setApiBaseUrl] = useState('http://localhost:49078');
   const [status, setStatus] = useState('Ready');
   const [isSending, setIsSending] = useState(false);
 
-  const currentEndpoints = useMemo(() => WEBHOOKS[environment], [environment]);
+  const currentEndpoints = useMemo(() => {
+    const paths = WEBHOOK_PATHS[environment];
+    return {
+      email: joinUrl(apiBaseUrl, paths.email),
+      sms: joinUrl(apiBaseUrl, paths.sms),
+    };
+  }, [apiBaseUrl, environment]);
+
+  async function pingBackend() {
+    setIsSending(true);
+    setStatus(`Checking backend at ${apiBaseUrl}...`);
+
+    try {
+      const response = await fetch(apiBaseUrl, { method: 'GET' });
+      setStatus(`✅ Backend reachable (HTTP ${response.status})`);
+    } catch (error) {
+      setStatus(`❌ Backend is not reachable at ${apiBaseUrl}: ${error.message}`);
+    } finally {
+      setIsSending(false);
+    }
+  }
 
   async function triggerWebhook(type) {
     const endpoint = currentEndpoints[type];
     setIsSending(true);
-    setStatus(`Sending ${type.toUpperCase()} to ${environment}...`);
+    setStatus(`Sending ${type.toUpperCase()} to ${endpoint}...`);
 
     try {
       const response = await fetch(endpoint, {
@@ -45,7 +71,7 @@ function App() {
 
       setStatus(`✅ ${type.toUpperCase()} webhook sent successfully (${response.status})`);
     } catch (error) {
-      setStatus(`❌ Failed to send ${type.toUpperCase()} webhook: ${error.message}`);
+      setStatus(`❌ Failed to send ${type.toUpperCase()} webhook at ${endpoint}: ${error.message}`);
     } finally {
       setIsSending(false);
     }
@@ -56,6 +82,20 @@ function App() {
       <section className="card">
         <h1>Webhook Sender</h1>
         <p className="subtitle">Dark mode control panel for Email and SMS triggers.</p>
+
+        <label htmlFor="base" className="label">Backend Base URL</label>
+        <div className="row">
+          <input
+            id="base"
+            className="input"
+            type="url"
+            value={apiBaseUrl}
+            onChange={(event) => setApiBaseUrl(event.target.value)}
+            placeholder="http://localhost:49078"
+            disabled={isSending}
+          />
+          <button type="button" onClick={pingBackend} disabled={isSending}>Check</button>
+        </div>
 
         <label htmlFor="env" className="label">Environment</label>
         <select
@@ -70,20 +110,8 @@ function App() {
         </select>
 
         <div className="buttons">
-          <button
-            type="button"
-            onClick={() => triggerWebhook('email')}
-            disabled={isSending}
-          >
-            Send Email
-          </button>
-          <button
-            type="button"
-            onClick={() => triggerWebhook('sms')}
-            disabled={isSending}
-          >
-            Send SMS
-          </button>
+          <button type="button" onClick={() => triggerWebhook('email')} disabled={isSending}>Send Email</button>
+          <button type="button" onClick={() => triggerWebhook('sms')} disabled={isSending}>Send SMS</button>
         </div>
 
         <div className="status" role="status" aria-live="polite">{status}</div>
