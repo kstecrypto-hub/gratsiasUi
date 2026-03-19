@@ -4,12 +4,12 @@ import './styles.css';
 
 const WEBHOOKS = {
   production: {
-    email: '/webhook/email',
-    sms: '/webhook/sms',
+    email: 'http://localhost:49078/webhook/email',
+    sms: 'http://localhost:49078/webhook/sms',
   },
   test: {
-    email: '/webhook-test/email',
-    sms: '/webhook-test/sms',
+    email: 'http://localhost:49078/webhook-test/email',
+    sms: 'http://localhost:49078/webhook-test/sms',
   },
 };
 
