@@ -2,95 +2,43 @@ import React, { useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import './styles.css';
 
-const WEBHOOK_PATHS = {
+const WEBHOOKS = {
   production: {
-    email: 'webhook/email',
-    sms: 'webhook/sms',
+    email: 'http://localhost:49078/webhook/email',
+    sms: 'http://localhost:49078/webhook/sms',
   },
   test: {
-    email: 'webhook-test/email',
-    sms: 'webhook-test/sms',
+    email: 'http://localhost:49078/webhook-test/email',
+    sms: 'http://localhost:49078/webhook-test/sms',
   },
 };
 
-function normalizeBaseUrl(input) {
-  const raw = input.trim();
-  if (!raw) {
-    return 'http://localhost:49078';
-  }
-
-  const dockerPortMap = raw.match(/^(\d+):(\d+)$/);
-  if (dockerPortMap) {
-    return `http://localhost:${dockerPortMap[1]}`;
-  }
-
-  const withProtocol = /^https?:\/\//i.test(raw) ? raw : `http://${raw}`;
-  return withProtocol.replace(/\/+$|\/$/, '');
-}
-
-function joinUrl(base, path) {
-  const cleanedBase = normalizeBaseUrl(base).replace(/\/+$/, '');
-  return `${cleanedBase}/${path}`;
-}
-
 function App() {
   const [environment, setEnvironment] = useState('production');
-  const [apiBaseUrl, setApiBaseUrl] = useState('http://localhost:49078');
   const [status, setStatus] = useState('Ready');
-  const [isSending, setIsSending] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
 
-  const normalizedBaseUrl = useMemo(() => normalizeBaseUrl(apiBaseUrl), [apiBaseUrl]);
+  const currentEndpoints = useMemo(() => WEBHOOKS[environment], [environment]);
 
-  const currentEndpoints = useMemo(() => {
-    const paths = WEBHOOK_PATHS[environment];
-    return {
-      email: joinUrl(normalizedBaseUrl, paths.email),
-      sms: joinUrl(normalizedBaseUrl, paths.sms),
-    };
-  }, [normalizedBaseUrl, environment]);
-
-  async function pingBackend() {
-    setIsSending(true);
-    setStatus(`Checking backend at ${normalizedBaseUrl}...`);
-
-    try {
-      const response = await fetch(normalizedBaseUrl, { method: 'GET' });
-      setStatus(`✅ Backend reachable at ${normalizedBaseUrl} (HTTP ${response.status})`);
-    } catch (error) {
-      setStatus(`❌ Backend is not reachable at ${normalizedBaseUrl}: ${error.message}`);
-    } finally {
-      setIsSending(false);
-    }
-  }
-
-  async function triggerWebhook(type) {
+  async function send(type) {
     const endpoint = currentEndpoints[type];
-    setIsSending(true);
-    setStatus(`Sending ${type.toUpperCase()} to ${endpoint}...`);
+    setIsLoading(true);
+    setStatus(`Sending ${type.toUpperCase()} using GET -> ${endpoint}`);
 
     try {
       const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          source: 'gratsias-ui',
-          channel: type,
-          environment,
-          timestamp: new Date().toISOString(),
-        }),
+        method: 'GET',
       });
 
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}`);
       }
 
-      setStatus(`✅ ${type.toUpperCase()} webhook sent successfully (${response.status})`);
+      setStatus(`✅ ${type.toUpperCase()} sent successfully (HTTP ${response.status})`);
     } catch (error) {
-      setStatus(`❌ Failed to send ${type.toUpperCase()} webhook at ${endpoint}: ${error.message}`);
+      setStatus(`❌ ${type.toUpperCase()} failed: ${error.message}`);
     } finally {
-      setIsSending(false);
+      setIsLoading(false);
     }
   }
 
@@ -98,25 +46,7 @@ function App() {
     <main className="page">
       <section className="card">
         <h1>Webhook Sender</h1>
-        <p className="subtitle">Dark mode control panel for Email and SMS triggers.</p>
-
-        <label htmlFor="base" className="label">Backend Base URL</label>
-        <div className="row">
-          <input
-            id="base"
-            className="input"
-            type="text"
-            value={apiBaseUrl}
-            onChange={(event) => setApiBaseUrl(event.target.value)}
-            placeholder="http://localhost:49078"
-            disabled={isSending}
-          />
-          <button type="button" onClick={pingBackend} disabled={isSending}>Check</button>
-        </div>
-
-        <p className="small-note">
-          Docker tip: if mapping is <code>49078:5678</code>, use <code>http://localhost:49078</code>.
-        </p>
+        <p className="subtitle">Windows browser → Docker backend at localhost:49078</p>
 
         <label htmlFor="env" className="label">Environment</label>
         <select
@@ -124,20 +54,22 @@ function App() {
           className="select"
           value={environment}
           onChange={(event) => setEnvironment(event.target.value)}
-          disabled={isSending}
+          disabled={isLoading}
         >
           <option value="production">Production</option>
           <option value="test">Test</option>
         </select>
 
         <div className="buttons">
-          <button type="button" onClick={() => triggerWebhook('email')} disabled={isSending}>Send Email</button>
-          <button type="button" onClick={() => triggerWebhook('sms')} disabled={isSending}>Send SMS</button>
+          <button type="button" onClick={() => send('email')} disabled={isLoading}>Send Email</button>
+          <button type="button" onClick={() => send('sms')} disabled={isLoading}>Send SMS</button>
         </div>
 
         <div className="status" role="status" aria-live="polite">{status}</div>
         <div className="hint">
-          Current endpoints: <code>{currentEndpoints.email}</code> and <code>{currentEndpoints.sms}</code>
+          Method: <code>GET</code><br />
+          Email: <code>{currentEndpoints.email}</code><br />
+          SMS: <code>{currentEndpoints.sms}</code>
         </div>
       </section>
     </main>
