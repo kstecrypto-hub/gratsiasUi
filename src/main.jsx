@@ -13,8 +13,23 @@ const WEBHOOK_PATHS = {
   },
 };
 
+function normalizeBaseUrl(input) {
+  const raw = input.trim();
+  if (!raw) {
+    return 'http://localhost:49078';
+  }
+
+  const dockerPortMap = raw.match(/^(\d+):(\d+)$/);
+  if (dockerPortMap) {
+    return `http://localhost:${dockerPortMap[1]}`;
+  }
+
+  const withProtocol = /^https?:\/\//i.test(raw) ? raw : `http://${raw}`;
+  return withProtocol.replace(/\/+$|\/$/, '');
+}
+
 function joinUrl(base, path) {
-  const cleanedBase = base.replace(/\/+$/, '');
+  const cleanedBase = normalizeBaseUrl(base).replace(/\/+$/, '');
   return `${cleanedBase}/${path}`;
 }
 
@@ -24,23 +39,25 @@ function App() {
   const [status, setStatus] = useState('Ready');
   const [isSending, setIsSending] = useState(false);
 
+  const normalizedBaseUrl = useMemo(() => normalizeBaseUrl(apiBaseUrl), [apiBaseUrl]);
+
   const currentEndpoints = useMemo(() => {
     const paths = WEBHOOK_PATHS[environment];
     return {
-      email: joinUrl(apiBaseUrl, paths.email),
-      sms: joinUrl(apiBaseUrl, paths.sms),
+      email: joinUrl(normalizedBaseUrl, paths.email),
+      sms: joinUrl(normalizedBaseUrl, paths.sms),
     };
-  }, [apiBaseUrl, environment]);
+  }, [normalizedBaseUrl, environment]);
 
   async function pingBackend() {
     setIsSending(true);
-    setStatus(`Checking backend at ${apiBaseUrl}...`);
+    setStatus(`Checking backend at ${normalizedBaseUrl}...`);
 
     try {
-      const response = await fetch(apiBaseUrl, { method: 'GET' });
-      setStatus(`✅ Backend reachable (HTTP ${response.status})`);
+      const response = await fetch(normalizedBaseUrl, { method: 'GET' });
+      setStatus(`✅ Backend reachable at ${normalizedBaseUrl} (HTTP ${response.status})`);
     } catch (error) {
-      setStatus(`❌ Backend is not reachable at ${apiBaseUrl}: ${error.message}`);
+      setStatus(`❌ Backend is not reachable at ${normalizedBaseUrl}: ${error.message}`);
     } finally {
       setIsSending(false);
     }
@@ -88,7 +105,7 @@ function App() {
           <input
             id="base"
             className="input"
-            type="url"
+            type="text"
             value={apiBaseUrl}
             onChange={(event) => setApiBaseUrl(event.target.value)}
             placeholder="http://localhost:49078"
@@ -96,6 +113,10 @@ function App() {
           />
           <button type="button" onClick={pingBackend} disabled={isSending}>Check</button>
         </div>
+
+        <p className="small-note">
+          Docker tip: if mapping is <code>49078:5678</code>, use <code>http://localhost:49078</code>.
+        </p>
 
         <label htmlFor="env" className="label">Environment</label>
         <select

@@ -62,6 +62,13 @@ h1 {
   background: #0e1635;
   color: inherit;
 }
+
+.small-note {
+  margin: -4px 0 16px;
+  color: #9fb1f7;
+  font-size: 0.85rem;
+}
+
 .select {
   width: 100%;
   border: 1px solid #4157ad;
