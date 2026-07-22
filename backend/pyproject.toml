@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling==1.31.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "yeastar-call-analyzer-backend"
+version = "1.0.0"
+description = "Production backend for the Yeastar Call Analyzer"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "alembic==1.18.5",
+  "argon2-cffi==25.1.0",
+  "celery[redis]==5.6.3",
+  "cryptography==49.0.0",
+  "email-validator==2.3.0",
+  "fastapi==0.139.0",
+  "httpx==0.28.1",
+  "itsdangerous==2.2.0",
+  "openai==2.45.0",
+  "orjson==3.11.9",
+  "psycopg[binary,pool]==3.3.4",
+  "pydantic==2.13.4",
+  "pydantic-settings==2.14.2",
+  "python-multipart==0.0.32",
+  "rapidfuzz==3.14.5",
+  "redis==6.4.0",
+  "sqlalchemy[asyncio]==2.0.51",
+  "tenacity==9.1.4",
+  "uvicorn[standard]==0.51.0",
+]
+
+[project.optional-dependencies]
+test = [
+  "aiosqlite==0.22.1",
+  "fakeredis==2.36.2",
+  "pytest==9.1.1",
+  "pytest-asyncio==1.4.0",
+  "pytest-cov==7.1.0",
+  "respx==0.23.1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+addopts = "-q --strict-markers --disable-warnings"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["app"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100

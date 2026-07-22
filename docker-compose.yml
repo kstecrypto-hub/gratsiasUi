@@ -1,0 +1,184 @@
+name: yeastar-call-analyzer
+
+x-backend-environment: &backend-environment
+  APP_ENV: ${APP_ENV:-production}
+  APP_SECRET_KEY: ${APP_SECRET_KEY:-}
+  APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Athens}
+  ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+  ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+  YEASTAR_NAME: ${YEASTAR_NAME:-}
+  YEASTAR_BASE_URL: ${YEASTAR_BASE_URL:-}
+  YEASTAR_CLIENT_ID: ${YEASTAR_CLIENT_ID:-}
+  YEASTAR_CLIENT_SECRET: ${YEASTAR_CLIENT_SECRET:-}
+  YEASTAR_DATE_FORMAT: ${YEASTAR_DATE_FORMAT:-MM/dd/yyyy HH:mm:ss}
+  YEASTAR_PAGE_SIZE: ${YEASTAR_PAGE_SIZE:-500}
+  YEASTAR_IGNORE_SSL_ERRORS: ${YEASTAR_IGNORE_SSL_ERRORS:-true}
+  YEASTAR_ALLOW_HTTP: ${YEASTAR_ALLOW_HTTP:-false}
+  YEASTAR_USER_AGENT: ${YEASTAR_USER_AGENT:-YeastarCallAnalyzer/1.0}
+  YEASTAR_AUTH_API_PATH: ${YEASTAR_AUTH_API_PATH:-/openapi/v1.0}
+  YEASTAR_SYSTEM_API_PATH: ${YEASTAR_SYSTEM_API_PATH:-/openapi/v1.0}
+  YEASTAR_EXTENSION_API_PATH: ${YEASTAR_EXTENSION_API_PATH:-/openapi/v1.0}
+  YEASTAR_CDR_API_PATH: ${YEASTAR_CDR_API_PATH:-/openapi/v2.0}
+  YEASTAR_RECORDING_API_PATH: ${YEASTAR_RECORDING_API_PATH:-/openapi/v1.0}
+  YEASTAR_CONNECT_TIMEOUT_SECONDS: ${YEASTAR_CONNECT_TIMEOUT_SECONDS:-10}
+  YEASTAR_READ_TIMEOUT_SECONDS: ${YEASTAR_READ_TIMEOUT_SECONDS:-60}
+  YEASTAR_DOWNLOAD_TIMEOUT_SECONDS: ${YEASTAR_DOWNLOAD_TIMEOUT_SECONDS:-300}
+  YEASTAR_TOKEN_REFRESH_SKEW_SECONDS: ${YEASTAR_TOKEN_REFRESH_SKEW_SECONDS:-120}
+  YEASTAR_TRANSIENT_RETRY_COUNT: ${YEASTAR_TRANSIENT_RETRY_COUNT:-1}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  OPENAI_TRANSCRIPTION_MODEL: ${OPENAI_TRANSCRIPTION_MODEL:-gpt-4o-transcribe}
+  OPENAI_DIARIZATION_MODEL: ${OPENAI_DIARIZATION_MODEL:-gpt-4o-transcribe-diarize}
+  TRANSCRIPTION_LANGUAGE: ${TRANSCRIPTION_LANGUAGE:-el}
+  DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in your local .env file}
+  REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+  DELETE_AUDIO_AFTER_TRANSCRIPTION: ${DELETE_AUDIO_AFTER_TRANSCRIPTION:-true}
+  TRANSCRIPT_RETENTION_DAYS: ${TRANSCRIPT_RETENTION_DAYS:-90}
+  MAX_PARALLEL_TRANSCRIPTIONS: ${MAX_PARALLEL_TRANSCRIPTIONS:-3}
+  FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:3000}
+  SECURE_COOKIES: ${SECURE_COOKIES:-true}
+  SESSION_TTL_SECONDS: ${SESSION_TTL_SECONDS:-28800}
+  LOGIN_RATE_LIMIT: ${LOGIN_RATE_LIMIT:-5/15minutes}
+  STORAGE_ROOT: ${STORAGE_ROOT:-/app/storage}
+  MAX_RECORDING_BYTES: ${MAX_RECORDING_BYTES:-524288000}
+  MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-25165824}
+
+x-backend-service: &backend-service
+  build:
+    context: ./backend
+  environment: *backend-environment
+  volumes:
+    - app_storage:/app/storage
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+  init: true
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-yeastar}
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in your local .env file}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  redis:
+    image: redis:8-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--save", "60", "1"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  migrate:
+    build:
+      context: ./backend
+    environment: *backend-environment
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  backend:
+    <<: *backend-service
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --proxy-headers
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  worker:
+    <<: *backend-service
+    command:
+      [
+        "celery",
+        "-A",
+        "app.workers.celery_app:celery_app",
+        "worker",
+        "--loglevel=INFO",
+        "--concurrency=1",
+        "--queues=analysis,maintenance",
+        "--beat",
+        "--schedule=/tmp/celerybeat-schedule",
+      ]
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "celery -A app.workers.celery_app:celery_app inspect ping --destination celery@$${HOSTNAME} --timeout=5 | grep -q pong",
+        ]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        BACKEND_URL: http://backend:8000
+    environment:
+      BACKEND_URL: http://backend:8000
+      NODE_ENV: production
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/login').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+    init: true
+
+volumes:
+  postgres_data:
+  redis_data:
+  app_storage:

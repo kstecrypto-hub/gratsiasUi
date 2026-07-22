@@ -1,0 +1,66 @@
+# Secrets and machine-local configuration
+.env
+.env.*
+!.env.example
+.npmrc
+.pypirc
+pip.conf
+docker-compose.override.yml
+secrets/
+credentials/
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# Runtime data and generated media
+.cache/
+work/
+*.db
+*.sqlite
+*.sqlite3
+*.backup
+*.bak
+*.dump
+*.wav
+*.mp3
+*.m4a
+*.ogg
+*.flac
+postgres_data/
+redis_data/
+minio_data/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+frontend/node_modules/
+frontend/.next/
+frontend/dist/
+frontend/out/
+frontend/coverage/
+frontend/playwright-report/
+frontend/test-results/
+frontend/.wrangler/
+
+# Application storage: keep the directory, never its contents
+storage/*
+!storage/.gitkeep
+
+# Editors and operating systems
+.idea/
+.vscode/
+.codex/
+**/.git/
+*.log
+.DS_Store
+Thumbs.db
