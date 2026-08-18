@@ -640,7 +640,10 @@ async def export_results(
             "Match count",
         ]
         for call, operator in pairs:
-            local_started = call.started_at.astimezone(timezone)
+            started_at = call.started_at
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=UTC)
+            local_started = started_at.astimezone(timezone)
             matches = grouped.get((call.id, operator.id), [])
             if not matches:
                 yield [

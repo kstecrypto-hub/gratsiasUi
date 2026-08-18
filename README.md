@@ -7,6 +7,40 @@ records, synthetic statistics, or runtime fixtures. If an external integration
 is not configured, the affected actions remain unavailable and the interface
 shows its real configuration state.
 
+[![Deployment: Docker Compose](https://img.shields.io/badge/deployment-Docker_Compose-2496ed?logo=docker&logoColor=white)](#3-local-deployment)
+[![Backend: FastAPI](https://img.shields.io/badge/backend-FastAPI-009688?logo=fastapi&logoColor=white)](backend/app/main.py)
+[![Frontend: Next.js](https://img.shields.io/badge/frontend-Next.js-111111?logo=nextdotjs&logoColor=white)](frontend/)
+[![Tests: Pytest + Playwright](https://img.shields.io/badge/tests-pytest_%2B_Playwright-2f855a)](#verification-scope)
+
+## Explore
+
+[Requirements](#1-requirements) | [Local deployment](#3-local-deployment) | [Production](#4-production-deployment) | [Yeastar setup](#5-yeastar-api-configuration) | [Analysis workflow](#11-running-an-analysis) | [Troubleshooting](#16-troubleshooting)
+
+## Architecture at a Glance
+
+```mermaid
+flowchart LR
+    Admin["Administrator browser"] --> Web["Next.js frontend"]
+    Web --> API["FastAPI backend"]
+    API --> PG[("PostgreSQL")]
+    API --> Redis[("Encrypted configuration\nand job state")]
+    API --> Queue[["Celery queue"]]
+    Queue --> Worker["Analysis worker"]
+    Worker --> PBX["Yeastar P-Series"]
+    Worker --> Audio["FFmpeg audio isolation"]
+    Audio --> OpenAI["OpenAI transcription"]
+    OpenAI --> Match["Phrase matching"]
+    Match --> PG
+    Worker --> Storage[("Recording storage")]
+```
+
+<details>
+<summary><strong>Operational safety model</strong></summary>
+
+Only the frontend is exposed publicly. The backend, PostgreSQL, and Redis stay on the private Compose network. External actions remain disabled until their integrations are configured, credentials are encrypted at rest, and retries are bounded by PBX and transcription-provider limits.
+
+</details>
+
 ## 1. Requirements
 
 - Docker Engine 26 or newer with Docker Compose v2
