@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from app.api import auth, health, jobs, keywords, operators, results, settings
+from app.api import auth, evaluation, health, jobs, keywords, operators, results, settings
 from app.auth.bootstrap import ensure_admin
 from app.core.config import get_settings
 from app.core.logging import configure_logging, redact_text
@@ -62,6 +62,8 @@ for api_router in (
     settings.router,
     jobs.router,
     results.router,
+    evaluation.features_router,
+    evaluation.router,
 ):
     app.include_router(api_router, prefix="/api")
 

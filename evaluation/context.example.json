@@ -1,0 +1,11 @@
+{
+  "direction": null,
+  "queue": null,
+  "is_queue": null,
+  "transfer_state": null,
+  "audio_topology": null,
+  "occurred_at": null,
+  "caller": null,
+  "callee": null,
+  "operators": []
+}

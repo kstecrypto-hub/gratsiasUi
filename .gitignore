@@ -60,6 +60,9 @@ storage/*
 # Local evaluation data and generated detailed reports
 evaluation/audio/
 evaluation/references/
+evaluation/context/
+evaluation/previews/
+evaluation/local/
 evaluation/*.jsonl
 !evaluation/manifest.example.jsonl
 evaluation/reports/*

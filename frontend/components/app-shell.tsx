@@ -7,6 +7,7 @@ import { api, messageFromError } from "@/lib/api";
 import type { Administrator } from "@/lib/types";
 import { ErrorState, LoadingState } from "@/components/page-state";
 import { setActiveTimezone } from "@/lib/format";
+import { EvaluationAvailability } from "@/components/evaluation-availability";
 
 const navigation = [
   { href: "/dashboard", label: "Dashboard" },
@@ -18,6 +19,7 @@ const navigation = [
 ] as const;
 
 function pageTitle(pathname: string): string {
+  if (pathname === "/evaluation" || pathname.startsWith("/evaluation/")) return "Evaluation";
   if (pathname.startsWith("/processing/")) return "Processing";
   if (pathname.startsWith("/calls/")) return "Call detail";
   return navigation.find((item) => pathname === item.href)?.label || "Yeastar Call Analyzer";
@@ -31,11 +33,17 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
   const [processingStatus, setProcessingStatus] = useState("");
+  const [evaluationEnabled, setEvaluationEnabled] = useState(false);
 
   const loadUser = useCallback(async () => {
     setError("");
     try {
       const currentUser = await api.auth.me();
+      try {
+        setEvaluationEnabled((await api.features()).evaluation_ui_enabled === true);
+      } catch {
+        setEvaluationEnabled(false);
+      }
       try {
         const applicationSettings = await api.settings.get();
         setActiveTimezone(applicationSettings.default_timezone);
@@ -94,6 +102,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             const active = pathname === item.href || (item.href === "/results" && pathname.startsWith("/calls/"));
             return <Link key={item.href} href={item.href} aria-current={active ? "page" : undefined} className={active ? "active" : ""}>{item.label}</Link>;
           })}
+          {evaluationEnabled ? <Link href="/evaluation" className={pathname.startsWith("/evaluation") ? "active" : ""} aria-current={pathname.startsWith("/evaluation") ? "page" : undefined}>Evaluation</Link> : null}
         </nav>
       </aside>
       {menuOpen ? <button className="sidebar-scrim" type="button" aria-label="Close navigation" onClick={() => setMenuOpen(false)} /> : null}
@@ -109,7 +118,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             <button className="button secondary compact" type="button" onClick={() => void logout()} disabled={loggingOut}>{loggingOut ? "Signing out…" : "Sign out"}</button>
           </div>
         </header>
-        <main id="main-content" className="page-content">{children}</main>
+        <main id="main-content" className="page-content"><EvaluationAvailability value={evaluationEnabled}>{children}</EvaluationAvailability></main>
       </div>
     </div>
   );

@@ -111,9 +111,9 @@ function zonedParts(date: Date, timeZone: string) {
 
 export function statusTone(status?: string): "success" | "warning" | "error" | "neutral" {
   const value = (status || "").toLowerCase().replaceAll("_", " ");
-  if (["connected", "ready", "completed", "enabled", "available"].includes(value)) return "success";
+  if (["connected", "ready", "completed", "enabled", "available", "verified"].includes(value)) return "success";
   if (["failed", "unavailable", "error", "cancelled", "disabled"].includes(value)) return "error";
-  if (["not configured", "completed with errors", "warning"].includes(value)) return "warning";
+  if (["not configured", "completed with errors", "warning", "in progress"].includes(value)) return "warning";
   return "neutral";
 }
 

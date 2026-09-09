@@ -1,2 +1,2 @@
-{"id":"call-001","audio":"audio/call-001.wav","reference":"references/call-001.json","split":"test","quality":"noisy_mobile","mode":"stereo"}
-{"id":"call-002","audio":"audio/call-002.wav","reference":"references/call-002.json","split":"test","quality":"clean_office","mode":"stereo"}
+{"evaluation_id":"call-001","audio":"audio/call-001.wav","reference":"references/call-001.json","context":"context/call-001.json","split":"dev","mode":"stereo"}
+{"evaluation_id":"call-002","audio":"audio/call-002.wav","reference":"references/call-002.json","context":"context/call-002.json","split":"test","mode":"mono"}

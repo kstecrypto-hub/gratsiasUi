@@ -1,4 +1,10 @@
 import type {
+  EvaluationDetail,
+  EvaluationFilter,
+  EvaluationKeyword,
+  EvaluationList,
+  HumanReference,
+  ReferenceDraft,
   Administrator,
   CallDetail,
   ConnectionState,
@@ -123,6 +129,15 @@ async function mutate<T>(path: string, method: "POST" | "PUT" | "PATCH" | "DELET
 }
 
 export const api = {
+  features: () => request<{ evaluation_ui_enabled: boolean }>("/features"),
+  evaluation: {
+    list: (filter: EvaluationFilter = "all") => request<EvaluationList>(`/evaluation?filter=${filter}`),
+    get: (id: string) => request<EvaluationDetail>(`/evaluation/${encodeURIComponent(id)}`),
+    keywords: () => request<EvaluationKeyword[]>("/evaluation/keywords"),
+    audioUrl: (id: string, channel?: 0 | 1) => apiUrl(`/evaluation/${encodeURIComponent(id)}/audio${channel === undefined ? "" : `/channel/${channel}`}`),
+    save: (id: string, input: ReferenceDraft, revision: string) => mutate<HumanReference>(`/evaluation/${encodeURIComponent(id)}/reference`, "PUT", { ...input, revision }),
+    verify: (id: string, revision: string) => mutate<HumanReference>(`/evaluation/${encodeURIComponent(id)}/verify`, "POST", { revision }),
+  },
   auth: {
     me: () => request<Administrator>("/auth/me"),
     async login(email: string, password: string) {

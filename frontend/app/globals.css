@@ -466,3 +466,19 @@ mark { padding: 1px 2px; background: #66512e; color: #fff3d8; border-radius: 2px
   .login-page { padding: 14px; }
   .login-panel { padding: 22px; }
 }
+.reference-fields { border: 0; padding: 0; margin: 0; min-width: 0; }
+.reference-segment { border-top: 1px solid var(--border); padding: 20px 0; }
+.reference-segment.excluded { border-left: 4px solid var(--muted); padding-left: 16px; }
+.reference-segment .speaker { margin-bottom: 12px; }
+.reference-segment textarea { width: 100%; }
+.reference-segment details { margin-top: 16px; }
+.audio-controls { align-items: center; margin-top: 12px; }
+.audio-controls output { font-variant-numeric: tabular-nums; min-width: 4em; }
+.audio-controls .field { margin: 0; }
+.entity-input { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; }
+.entity-input .field { flex: 1; min-width: 140px; }
+.entity-chips { display: flex; flex-wrap: wrap; gap: 6px; list-style: none; padding: 0; margin: 0; width: 100%; }
+.entity-chips li { border: 1px solid var(--border); padding: 4px 8px; border-radius: 4px; overflow-wrap: anywhere; }
+.entity-chips button { margin-left: 8px; }
+.keyword-truth { display: grid; gap: 10px; }
+.quality-definitions { margin: 14px 0; }

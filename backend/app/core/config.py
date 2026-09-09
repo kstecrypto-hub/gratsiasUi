@@ -73,6 +73,9 @@ class Settings(BaseSettings):
     TRUSTED_HOSTS: str = "localhost,127.0.0.1,backend"
     SECURE_COOKIES: bool | None = None
     STORAGE_ROOT: Path = Path("/app/storage")
+    EVALUATION_UI_ENABLED: bool = False
+    EVALUATION_ROOT: Path = Path(__file__).resolve().parents[3] / "evaluation"
+    EVALUATION_MANIFEST: str = "manifest.local.jsonl"
     MAX_REQUEST_BYTES: int = Field(default=2 * 1024 * 1024, ge=1024, le=20 * 1024 * 1024)
     MAX_RECORDING_BYTES: int = Field(default=500 * 1024 * 1024, ge=1024 * 1024)
     MAX_UPLOAD_BYTES: int = Field(

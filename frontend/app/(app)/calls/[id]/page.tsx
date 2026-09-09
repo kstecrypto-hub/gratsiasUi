@@ -2,7 +2,10 @@
 
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
+import { CallMetadata } from "@/components/call-metadata";
+import { RecordingPlayer, useRecordingPlayer } from "@/components/recording-player";
+import { SpeakerLabel } from "@/components/speaker-label";
 import { ErrorState, LoadingState, TableEmpty } from "@/components/page-state";
 import { StatusLabel } from "@/components/status-label";
 import { api, messageFromError } from "@/lib/api";
@@ -12,11 +15,10 @@ import type { CallDetail, KeywordMatch, TranscriptSegment } from "@/lib/types";
 export default function CallDetailPage() {
   const params = useParams<{ id: string }>();
   const id = params.id;
-  const audioRef = useRef<HTMLAudioElement>(null);
+  const { audioRef, seek } = useRecordingPlayer();
   const [call, setCall] = useState<CallDetail>();
   const [error, setError] = useState("");
   const [actionError, setActionError] = useState("");
-  const [audioError, setAudioError] = useState("");
   const [retrying, setRetrying] = useState(false);
   const [assigning, setAssigning] = useState(false);
   const [assignmentError, setAssignmentError] = useState("");
@@ -55,12 +57,6 @@ export default function CallDetailPage() {
     if (assignmentOperators.length === 0) setAssignmentOperatorId("");
   }, [assignmentOperators, assignmentOperatorId]);
   useEffect(() => { setAssignmentDismissed(false); }, [call?.id]);
-
-  function seek(seconds: number) {
-    if (!audioRef.current) return;
-    audioRef.current.currentTime = Math.max(0, seconds);
-    audioRef.current.play().catch(() => undefined);
-  }
 
   async function retry() {
     setRetrying(true);
@@ -127,16 +123,16 @@ export default function CallDetailPage() {
 
       <section className="section" aria-labelledby="call-info-title">
         <div className="section-header"><div><h2 id="call-info-title">Call information</h2></div><StatusLabel status={call.processing_status || call.status} /></div>
-        <dl className="detail-grid">
-          <div><dt>Date and time</dt><dd>{formatDateTime(call.occurred_at || call.started_at)}</dd></div>
-          <div><dt>Operator</dt><dd>{operatorName}</dd></div>
-          <div><dt>Caller</dt><dd>{call.caller || "—"}</dd></div>
-          <div><dt>Callee</dt><dd>{call.callee || "—"}</dd></div>
-          <div><dt>Duration</dt><dd>{formatDuration(call.duration_seconds)}</dd></div>
-          <div><dt>Direction</dt><dd>{titleCase(call.direction)}</dd></div>
-          <div><dt>Queue</dt><dd>{call.queue || "—"}</dd></div>
-          <div><dt>Detected phrases</dt><dd>{matches.length}</dd></div>
-        </dl>
+        <CallMetadata items={[
+          { label: "Date and time", value: formatDateTime(call.occurred_at || call.started_at) },
+          { label: "Operator", value: operatorName },
+          { label: "Caller", value: call.caller || "—" },
+          { label: "Callee", value: call.callee || "—" },
+          { label: "Duration", value: formatDuration(call.duration_seconds) },
+          { label: "Direction", value: titleCase(call.direction) },
+          { label: "Queue", value: call.queue || "—" },
+          { label: "Detected phrases", value: matches.length },
+        ]} />
       </section>
 
       {assignmentAvailable && !assignmentDismissed ? (
@@ -205,7 +201,7 @@ export default function CallDetailPage() {
 
       <section className="section" aria-labelledby="recording-title">
         <div className="section-header"><div><h2 id="recording-title">Recording</h2><p>Use a detected phrase timestamp to jump to that moment.</p></div></div>
-        {hasAudio ? <><audio ref={audioRef} className="audio-player" controls preload="metadata" src={api.calls.audioUrl(id)} onError={() => setAudioError("The recording could not be played. Your session may have expired or the audio may have been removed according to the retention settings.")}>Your browser does not support audio playback.</audio>{audioError ? <div className="form-error" role="alert">{audioError}</div> : null}</> : <div className="notice" role="status">No recording is available for this call.</div>}
+        {hasAudio ? <RecordingPlayer key={id} audioRef={audioRef} src={api.calls.audioUrl(id)} errorMessage="The recording could not be played. Your session may have expired or the audio may have been removed according to the retention settings." /> : <div className="notice" role="status">No recording is available for this call.</div>}
       </section>
 
       <section className="section" aria-labelledby="matches-title">
@@ -236,7 +232,7 @@ export default function CallDetailPage() {
 function TranscriptRow({ segment, matches, onSeek }: { segment: TranscriptSegment; matches: KeywordMatch[]; onSeek: (seconds: number) => void }) {
   const segmentMatches = matches.filter((match) => String(match.transcript_segment_id) === String(segment.id));
   const terms = segmentMatches.map((match) => match.original_matched_text || match.keyword_phrase || match.keyword || "").filter(Boolean);
-  return <div className="transcript-segment"><div className="speaker"><strong>{segment.speaker_label || "Unknown speaker"}</strong><span>{titleCase(segment.speaker_source)}</span><br /><button type="button" className="text-button" onClick={() => onSeek(segment.start_timestamp)}>{formatTimestamp(segment.start_timestamp)}</button></div><p className="transcript-text">{highlight(segment.original_text, terms)}</p></div>;
+  return <div className="transcript-segment"><SpeakerLabel label={segment.speaker_label} source={segment.speaker_source} timestamp={segment.start_timestamp} onSeek={onSeek} /><p className="transcript-text">{highlight(segment.original_text, terms)}</p></div>;
 }
 
 function highlight(text: string, terms: string[]) {

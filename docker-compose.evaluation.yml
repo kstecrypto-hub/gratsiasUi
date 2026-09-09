@@ -1,0 +1,7 @@
+# Explicit local labeling opt-in; never part of the default Compose startup.
+services:
+  backend:
+    environment:
+      EVALUATION_UI_ENABLED: "true"
+    volumes:
+      - ./evaluation:/app/evaluation

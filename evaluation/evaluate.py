@@ -13,12 +13,13 @@ import csv
 import json
 import math
 import os
+import re
 import statistics
 import subprocess
 import unicodedata
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Iterable
 
 
@@ -144,6 +145,7 @@ class ReferenceSegment:
     end: float
     text: str
     entities: dict[str, list[str]] = field(default_factory=dict)
+    exclude_from_wer: bool = False
 
 
 @dataclass(frozen=True)
@@ -165,6 +167,8 @@ class ReferenceDocument:
     quality: str | None = None
     mode: str | None = None
     split: str | None = None
+    operator_channel: int | None = None
+    verification_status: str | None = None
 
 
 @dataclass(frozen=True)
@@ -194,7 +198,10 @@ def load_manifest(path: Path) -> list[dict[str, Any]]:
             if not line.strip():
                 continue
             try:
-                records.append(json.loads(line))
+                record = json.loads(line)
+                if isinstance(record, dict) and "id" not in record and "evaluation_id" in record:
+                    record["id"] = record["evaluation_id"]
+                records.append(record)
             except json.JSONDecodeError as exc:
                 raise ValueError(f"{path}:{line_number}: invalid JSON") from exc
     return records
@@ -212,12 +219,14 @@ def validate_manifest(records: list[dict[str, Any]]) -> list[str]:
             continue
         missing = [
             key
-            for key in ("id", "audio", "reference", "split", "quality", "mode")
+            for key in ("id", "audio", "reference", "split", "mode")
             if not record.get(key)
         ]
         if missing:
             errors.append(f"{label}: missing {', '.join(missing)}")
         record_id = str(record.get("id", ""))
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}", record_id):
+            errors.append(f"{label}: invalid evaluation id")
         if record_id in seen_ids:
             errors.append(f"{label}: duplicate id {record_id!r}")
         seen_ids.add(record_id)
@@ -241,6 +250,7 @@ def load_reference(path: Path) -> ReferenceDocument:
                 start=float(segment.get("start", 0)),
                 end=float(segment.get("end", 0)),
                 text=str(segment.get("text", "")),
+                exclude_from_wer=segment.get("exclude_from_wer") is True,
                 entities={
                     str(key): [str(item) for item in value]
                     for key, value in (segment.get("entities") or {}).items()
@@ -254,6 +264,8 @@ def load_reference(path: Path) -> ReferenceDocument:
         quality=payload.get("quality"),
         mode=payload.get("mode"),
         split=payload.get("split"),
+        operator_channel=payload.get("operator_channel"),
+        verification_status=payload.get("verification_status"),
     )
 
 
@@ -334,15 +346,18 @@ def _attribution_accuracy(reference: ReferenceDocument, hypothesis: HypothesisDo
         best_overlap = 0.0
         for hyp_segment in hypothesis.segments:
             overlap = _overlap(ref_segment, hyp_segment)
-            if overlap > best_overlap:
+            if overlap > best_overlap or (
+                overlap > 0 and overlap == best_overlap and ref_segment.channel is not None
+                and hyp_segment.channel == ref_segment.channel
+                and best is not None and best.channel != ref_segment.channel
+            ):
                 best_overlap = overlap
                 best = hyp_segment
         if best is None:
             continue
-        if ref_segment.channel is not None and best.channel is not None:
-            matches = ref_segment.channel == best.channel
-        else:
-            matches = normalize_greek(ref_segment.speaker) == normalize_greek(best.speaker)
+        matches = _speaker_role(ref_segment.speaker) == _speaker_role(best.speaker)
+        if ref_segment.channel is not None:
+            matches = matches and ref_segment.channel == best.channel
         if matches:
             correct += 1
     return correct / len(reference.segments)
@@ -362,47 +377,74 @@ def _review_rate(hypothesis: HypothesisDocument) -> float:
     return flagged / len(hypothesis.segments)
 
 
+def _text_scoring_segments(reference: ReferenceDocument, hypothesis: HypothesisDocument):
+    """Remove exclusions from both sides without guessing words at time boundaries.
+
+    Hypothesis chunks crossing an exclusion need word timestamps or a split at
+    the boundary. Fail rather than discard audible words or score noise as ASR.
+    """
+    excluded = [segment for segment in reference.segments if segment.exclude_from_wer]
+    scored_hypothesis = []
+    for segment in hypothesis.segments:
+        intervals = sorted(
+            (max(segment.start, region.start), min(segment.end, region.end))
+            for region in excluded
+            if (region.channel is None or segment.channel is None or region.channel == segment.channel)
+            and min(segment.end, region.end) > max(segment.start, region.start)
+        )
+        if not intervals:
+            scored_hypothesis.append(segment)
+            continue
+        covered_until = segment.start
+        for start, end in intervals:
+            if start > covered_until + 1e-6:
+                break
+            covered_until = max(covered_until, end)
+        if covered_until < segment.end - 1e-6:
+            raise ValueError("Hypothesis segment crosses an excluded region; split it at the exclusion boundaries before scoring.")
+    return ([segment for segment in reference.segments if not segment.exclude_from_wer],
+            scored_hypothesis)
+
+
+def _speaker_role(speaker: str) -> str:
+    normalized = normalize_greek(speaker)
+    if normalized in {"operator", "agent"}:
+        return "operator"
+    if normalized in {"customer", "caller", "callee"}:
+        return "customer"
+    return normalized
+
+
+def _is_role(segment, role: str, reference: ReferenceDocument) -> bool:
+    # Text scoring uses human channel truth independently of predicted attribution.
+    if reference.mode == "stereo" and reference.operator_channel in {0, 1} and segment.channel in {0, 1}:
+        return (segment.channel == reference.operator_channel) == (role == "operator")
+    return _speaker_role(segment.speaker) == role
+
+
+
 def compute_call_metrics(
     reference: ReferenceDocument, hypothesis: HypothesisDocument
 ) -> dict[str, Any]:
-    ref_text = " ".join(segment.text for segment in reference.segments)
-    hyp_text = " ".join(segment.text for segment in hypothesis.segments)
+    reference_segments, hypothesis_segments = _text_scoring_segments(reference, hypothesis)
+    ref_text = " ".join(segment.text for segment in sorted(reference_segments, key=lambda row: row.start))
+    hyp_text = " ".join(segment.text for segment in sorted(hypothesis_segments, key=lambda row: row.start))
 
     operator_ref = " ".join(
         segment.text
-        for segment in reference.segments
-        if segment.channel in {0, 1}
-        and (
-            (segment.channel == 0 and reference.mode == "stereo")
-            or normalize_greek(segment.speaker) in {"operator", "agent"}
-        )
+        for segment in reference_segments if _is_role(segment, "operator", reference)
     )
     customer_ref = " ".join(
         segment.text
-        for segment in reference.segments
-        if segment.channel in {0, 1}
-        and (
-            (segment.channel == 1 and reference.mode == "stereo")
-            or normalize_greek(segment.speaker) in {"customer", "caller", "callee"}
-        )
+        for segment in reference_segments if _is_role(segment, "customer", reference)
     )
     operator_hyp = " ".join(
         segment.text
-        for segment in hypothesis.segments
-        if segment.channel in {0, 1}
-        and (
-            (segment.channel == 0 and reference.mode == "stereo")
-            or normalize_greek(segment.speaker) in {"operator", "agent"}
-        )
+        for segment in hypothesis_segments if _is_role(segment, "operator", reference)
     )
     customer_hyp = " ".join(
         segment.text
-        for segment in hypothesis.segments
-        if segment.channel in {0, 1}
-        and (
-            (segment.channel == 1 and reference.mode == "stereo")
-            or normalize_greek(segment.speaker) in {"customer", "caller", "callee"}
-        )
+        for segment in hypothesis_segments if _is_role(segment, "customer", reference)
     )
 
     expected_keywords, detected_keywords = _keyword_sets(reference, hypothesis)
@@ -792,7 +834,8 @@ def run_transcriber(audio: Path, version: str, reference: Path) -> HypothesisDoc
     if not reference.is_file():
         raise FileNotFoundError(reference)
     completed = subprocess.run(
-        [command, str(audio), version, str(reference)],
+        # Never give the evaluated system the human answer file.
+        [command, str(audio), version],
         capture_output=True,
         text=True,
         check=False,
@@ -848,10 +891,14 @@ def _run_manifest(manifest: Path, output_dir: Path) -> int:
         for version in ("legacy-v1", "pipeline-v2"):
             processed = ProcessedCall(id=str(record["id"]), version=version, status="error")
             try:
-                hypothesis = run_transcriber(
-                    Path(record["audio"]), version, Path(record["reference"])
-                )
-                reference = load_reference(Path(record["reference"]))
+                audio_path = _manifest_file(manifest, record["audio"])
+                reference_path = _manifest_file(manifest, record["reference"])
+                reference = load_reference(reference_path)
+                if reference.verification_status != "verified":
+                    raise ValueError("Human reference must be explicitly verified before evaluation.")
+                if reference.id != record["id"]:
+                    raise ValueError("Human reference ID does not match the manifest.")
+                hypothesis = run_transcriber(audio_path, version, reference_path)
                 metrics = compute_call_metrics(reference, hypothesis)
                 metrics["_quality"] = reference.quality
                 processed.status = "success"
@@ -864,7 +911,19 @@ def _run_manifest(manifest: Path, output_dir: Path) -> int:
     legacy = aggregate_metrics(calls_by_version.get("legacy-v1", []))
     v2 = aggregate_metrics(calls_by_version.get("pipeline-v2", []))
     write_reports(output_dir, legacy, v2, load_criteria())
-    return 0
+    return 1 if any(call.status != "success" for calls in calls_by_version.values() for call in calls) else 0
+
+
+def _manifest_file(manifest: Path, value: str) -> Path:
+    root = manifest.resolve().parent
+    relative = Path(value)
+    if (relative.is_absolute() or PureWindowsPath(value).is_absolute() or "\\" in value
+            or ":" in value or ".." in relative.parts):
+        raise ValueError("Invalid local evaluation path.")
+    path = (root / relative).resolve()
+    if not path.is_relative_to(root):
+        raise ValueError("Evaluation path escapes the manifest directory.")
+    return path
 
 
 def _aggregate_per_call_results(results_dir: Path, output_dir: Path) -> int:

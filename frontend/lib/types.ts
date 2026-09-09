@@ -1,5 +1,65 @@
 export type Identifier = string | number;
 
+export type EvaluationFilter = "all" | "dev" | "test" | "unverified" | "verified";
+export type ReferenceStatus = "not_started" | "in_progress" | "verified";
+export type QualityLabel = "clean" | "normal" | "noisy" | "very_noisy";
+export type ReferenceEntities = {
+  names: string[];
+  telephone_numbers: string[];
+  licence_plates: string[];
+  vehicle_models: string[];
+};
+export type HumanReferenceSegment = {
+  speaker: "Operator" | "Customer" | "Other" | "Unknown";
+  channel: 0 | 1 | null;
+  start: number;
+  end: number;
+  text: string;
+  exclude_from_wer: boolean;
+  entities: ReferenceEntities;
+};
+export type ReferenceDraft = {
+  quality: QualityLabel | null;
+  operator_channel: 0 | 1 | null;
+  operator_channel_answered: boolean;
+  expected_keywords: string[];
+  segments: HumanReferenceSegment[];
+};
+export type HumanReference = ReferenceDraft & {
+  verification_status: ReferenceStatus;
+  verified_at: string | null;
+  revision: string;
+};
+export type EvaluationRow = {
+  evaluation_id: string;
+  split: "dev" | "test";
+  duration_seconds: number;
+  mode: "stereo" | "mono";
+  direction: string | null;
+  quality: QualityLabel | null;
+  verification_status: ReferenceStatus;
+};
+export type EvaluationList = {
+  items: EvaluationRow[];
+  progress: Record<"all" | "dev" | "test", { verified: number; total: number }>;
+};
+export type EvaluationKeyword = { id: string; canonical_phrase: string; category_name: string };
+export type EvaluationDetail = Pick<EvaluationRow, "evaluation_id" | "split" | "mode" | "duration_seconds"> & {
+  metadata: {
+    direction: string | null;
+    queue: string | null;
+    is_queue: boolean | null;
+    transfer_state: string | null;
+    audio_topology: string | null;
+    occurred_at: string | null;
+    caller: string | null;
+    callee: string | null;
+    operators: { name: string; extension: string }[];
+  };
+  reference: HumanReference;
+};
+
+
 export type ConnectionState = {
   status: string;
   message?: string | null;

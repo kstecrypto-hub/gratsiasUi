@@ -17,6 +17,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import app.api.auth as auth_api
+import app.api.evaluation as evaluation_api
 import app.api.dependencies as api_dependencies
 import app.api.health as health_api
 import app.api.jobs as jobs_api
@@ -192,6 +193,8 @@ async def api_harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         settings_api.router,
         jobs_api.router,
         results_api.router,
+        evaluation_api.features_router,
+        evaluation_api.router,
     ):
         test_app.include_router(router, prefix="/api")
 
