@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import Field
@@ -61,11 +62,75 @@ class TranscriptSegmentResponse(APIModel):
     end_timestamp: Decimal
     original_text: str
     confidence: Decimal | None
+    transcription_model: str
+    mean_logprob: Decimal | None = None
+    low_logprob_ratio: Decimal | None = None
+    quality_flags: list[str] = Field(default_factory=list)
+    audio_variant: str | None = None
+    channel_index: int | None = None
+    sequence_number: int | None = None
     matches: list[MatchResponse]
+
+
+class TranscriptQualitySummaryResponse(APIModel):
+    transcript_id: UUID
+    transcription_mode: (
+        Literal[
+            "legacy",
+            "operator_channel",
+            "dual_channel",
+            "mono_diarization",
+        ]
+        | None
+    )
+    quality_summary: dict[str, Any] | None = None
+
+
+class CallReprocessRequest(APIModel):
+    pipeline_version: Literal["legacy-v1", "pipeline-v2"]
+    transcript_id: UUID | None = None
+    operator_id: UUID | None = None
+
+
+class SpeakerAssignmentRequest(APIModel):
+    transcript_id: UUID
+    operator_id: UUID
+    operator_channel_index: Literal[0, 1]
+
+
+class SpeakerAssignmentResponse(APIModel):
+    transcript_id: UUID
+    transcription_mode: (
+        Literal[
+            "legacy",
+            "operator_channel",
+            "dual_channel",
+            "mono_diarization",
+        ]
+        | None
+    )
+    speaker_attribution_status: (
+        Literal[
+            "confirmed_by_pbx",
+            "caller_callee_only",
+            "channel_unknown",
+            "anonymous_diarization",
+            "manually_assigned",
+        ]
+        | None
+    )
+    speaker_assignment_required: bool
+    available_channels: list[int] = Field(default_factory=list)
+    operator_id: UUID | None = None
+    operator_channel_index: int | None = None
+    confidence_status: str | None = None
+    quality_flags: list[str] = Field(default_factory=list)
+    pipeline_version: str | None = None
 
 
 class CallDetailResponse(APIModel):
     id: UUID
+    transcript_id: UUID | None = None
     started_at: datetime
     caller: str | None
     caller_name: str | None
@@ -80,4 +145,22 @@ class CallDetailResponse(APIModel):
     participants: list[dict]
     matches: list[MatchResponse]
     transcript_segments: list[TranscriptSegmentResponse]
+    transcription_mode: (
+        Literal[
+            "legacy",
+            "operator_channel",
+            "dual_channel",
+            "mono_diarization",
+        ]
+        | None
+    ) = None
+    speaker_attribution_status: str | None = None
+    speaker_assignment_required: bool = False
+    available_channels: list[int] = Field(default_factory=list)
+    confidence_status: str | None = None
+    quality_flags: list[str] = Field(default_factory=list)
+    pipeline_version: str | None = None
+    transcript_quality_summaries: list[TranscriptQualitySummaryResponse] = Field(
+        default_factory=list
+    )
     processing_history: list[dict]

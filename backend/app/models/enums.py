@@ -48,6 +48,21 @@ class TranscriptStatus(StrEnum):
     FAILED = "failed"
 
 
+class TranscriptionMode(StrEnum):
+    LEGACY = "legacy"
+    OPERATOR_CHANNEL = "operator_channel"
+    DUAL_CHANNEL = "dual_channel"
+    MONO_DIARIZATION = "mono_diarization"
+
+
+class SpeakerAttributionStatus(StrEnum):
+    CONFIRMED_BY_PBX = "confirmed_by_pbx"
+    CALLER_CALLEE_ONLY = "caller_callee_only"
+    CHANNEL_UNKNOWN = "channel_unknown"
+    ANONYMOUS_DIARIZATION = "anonymous_diarization"
+    MANUALLY_ASSIGNED = "manually_assigned"
+
+
 class SpeakerSource(StrEnum):
     YEASTAR_EXTENSION = "yeastar_extension"
     STEREO_CHANNEL = "stereo_channel"

@@ -5,6 +5,7 @@ import hashlib
 import json
 import mimetypes
 import secrets
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -50,6 +51,9 @@ class AudioChunk:
     path: Path
     start_seconds: float
     end_seconds: float
+    chunk_index: int | None = None
+    hard_cut: bool = False
+    overlap_before_ms: int = 0
 
 
 class AudioProcessor:
@@ -246,6 +250,114 @@ class AudioProcessor:
                 str(temporary),
             )
             temporary.replace(destination)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
+        return destination
+
+    async def apply_lossless_audio_filter(
+        self,
+        source: Path,
+        destination: Path,
+        *,
+        audio_filter: str,
+    ) -> Path:
+        """Atomically render one filtered 16 kHz mono PCM16 WAV variant."""
+
+        if not audio_filter or "\x00" in audio_filter:
+            raise InvalidAudioError("Audio filter profile is invalid.")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.partial_wav_path(destination)
+        temporary.unlink(missing_ok=True)
+        destination.unlink(missing_ok=True)
+        try:
+            await self._run(
+                "ffmpeg",
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(source),
+                "-map",
+                "0:a:0",
+                "-filter:a",
+                audio_filter,
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                "-c:a",
+                "pcm_s16le",
+                "-y",
+                str(temporary),
+            )
+            temporary.replace(destination)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            destination.unlink(missing_ok=True)
+            raise
+        return destination
+
+    @staticmethod
+    def partial_wav_path(destination: Path) -> Path:
+        return destination.with_suffix(".part.wav")
+
+    async def extract_pcm_wav_range(
+        self,
+        source: Path,
+        destination: Path,
+        *,
+        start_sample: int,
+        end_sample: int,
+        sample_rate_hz: int = 16_000,
+    ) -> Path:
+        """Copy an exact sample range from canonical PCM WAV into a lossless WAV."""
+
+        if (
+            start_sample < 0
+            or end_sample <= start_sample
+            or sample_rate_hz != 16_000
+        ):
+            raise InvalidAudioError("Audio range parameters are invalid.")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.partial_wav_path(destination)
+        temporary.unlink(missing_ok=True)
+        expected_frames = end_sample - start_sample
+        expected_bytes = expected_frames * 2
+        try:
+            with wave.open(str(source), "rb") as reader:
+                if (
+                    reader.getnchannels() != 1
+                    or reader.getsampwidth() != 2
+                    or reader.getframerate() != sample_rate_hz
+                    or reader.getcomptype() != "NONE"
+                    or end_sample > reader.getnframes()
+                ):
+                    raise InvalidAudioError(
+                        "Speech segmentation requires 16 kHz mono PCM16 WAV audio."
+                    )
+                reader.setpos(start_sample)
+                payload = reader.readframes(expected_frames)
+            if len(payload) != expected_bytes:
+                raise InvalidAudioError("Audio range could not be read completely.")
+            with wave.open(str(temporary), "wb") as writer:
+                writer.setnchannels(1)
+                writer.setsampwidth(2)
+                writer.setframerate(sample_rate_hz)
+                writer.writeframes(payload)
+            if temporary.stat().st_size != expected_bytes + 44:
+                raise AudioToolError("Audio range output is incomplete.")
+            temporary.replace(destination)
+        except InvalidAudioError:
+            temporary.unlink(missing_ok=True)
+            raise
+        except (EOFError, wave.Error) as exc:
+            temporary.unlink(missing_ok=True)
+            raise InvalidAudioError("Audio file could not be decoded.") from exc
+        except OSError as exc:
+            temporary.unlink(missing_ok=True)
+            raise AudioToolError("Audio range could not be created.") from exc
         except Exception:
             temporary.unlink(missing_ok=True)
             raise

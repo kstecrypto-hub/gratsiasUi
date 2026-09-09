@@ -316,6 +316,8 @@ export type TranscriptSegment = {
   original_text: string;
   confidence?: number | null;
   sequence_number?: number;
+  channel_index?: number | null;
+  quality_flags?: string[];
 };
 
 export type ProcessingHistoryEntry = {
@@ -328,6 +330,7 @@ export type ProcessingHistoryEntry = {
 
 export type CallDetail = {
   id: Identifier;
+  transcript_id?: Identifier | null;
   occurred_at?: string;
   started_at?: string;
   operator?: Pick<Operator, "id" | "display_name" | "extension_number">;
@@ -341,9 +344,43 @@ export type CallDetail = {
   processing_status?: string;
   recording_available?: boolean;
   audio_available?: boolean;
+  transcription_mode?: string | null;
+  speaker_attribution_status?: string | null;
+  speaker_assignment_required?: boolean;
+  available_channels?: number[];
+  confidence_status?: string | null;
+  pipeline_version?: string | null;
+  participants?: Array<{
+    operator_id?: Identifier | null;
+    operator_name?: string | null;
+    display_name?: string | null;
+    extension?: string | null;
+    role?: string;
+    answered?: boolean;
+    operator?: { display_name?: string | null } | null;
+  }>;
   matches?: KeywordMatch[];
   transcript_segments?: TranscriptSegment[];
   processing_history?: ProcessingHistoryEntry[];
+};
+
+export type SpeakerAssignmentInput = {
+  transcript_id: Identifier;
+  operator_id: Identifier;
+  operator_channel_index: 0 | 1;
+};
+
+export type SpeakerAssignmentResult = {
+  transcript_id: Identifier;
+  transcription_mode?: string | null;
+  speaker_attribution_status?: string | null;
+  speaker_assignment_required?: boolean;
+  available_channels?: number[];
+  operator_id?: Identifier | null;
+  operator_channel_index?: number | null;
+  confidence_status?: string | null;
+  quality_flags?: string[];
+  pipeline_version?: string | null;
 };
 
 export type ResultFilters = {

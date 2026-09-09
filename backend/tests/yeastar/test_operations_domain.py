@@ -191,6 +191,52 @@ def _client_settings(tmp_path: Path) -> Settings:
     )
 
 
+class _CapabilityRedis:
+    def __init__(self) -> None:
+        self.values: dict[str, str] = {}
+        self.writes: list[tuple[str, int, str]] = []
+
+    async def get(self, key: str) -> str | None:
+        return self.values.get(key)
+
+    async def setex(self, key: str, ttl: int, value: str) -> None:
+        self.values[key] = value
+        self.writes.append((key, ttl, value))
+
+
+@pytest.mark.asyncio
+async def test_stereo_capability_cache_is_scoped_to_pbx_configuration(
+    tmp_path: Path,
+) -> None:
+    redis = _CapabilityRedis()
+    first_settings = _client_settings(tmp_path)
+    second_settings = first_settings.model_copy(
+        update={
+            "YEASTAR_BASE_URL": "https://second-pbx.example.test",
+            "YEASTAR_CLIENT_ID": "second-client",
+        }
+    )
+    first = YeastarClient(first_settings, redis)  # type: ignore[arg-type]
+    second = YeastarClient(second_settings, redis)  # type: ignore[arg-type]
+    first._authorized_get = AsyncMock(  # type: ignore[method-assign]
+        return_value={"auto_record": {"enb_channel_separate": "1"}}
+    )
+    second._authorized_get = AsyncMock(  # type: ignore[method-assign]
+        return_value={"auto_record": {"enb_channel_separate": "0"}}
+    )
+
+    assert await first.stereo_separated_recording_enabled() is True
+    assert await second.stereo_separated_recording_enabled() is False
+    assert len(redis.values) == 2
+    assert all(key.startswith("yca:yeastar:stereo-capability:v2:") for key in redis.values)
+    assert first_settings.YEASTAR_BASE_URL not in " ".join(redis.values)
+    assert second_settings.YEASTAR_BASE_URL not in " ".join(redis.values)
+
+    first._authorized_get.reset_mock()
+    assert await first.stereo_separated_recording_enabled() is True
+    first._authorized_get.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_streamed_json_error_is_never_moved_as_audio(tmp_path: Path) -> None:
     async def handler(request: httpx.Request) -> httpx.Response:

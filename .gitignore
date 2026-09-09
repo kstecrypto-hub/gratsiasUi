@@ -51,10 +51,19 @@ frontend/coverage/
 frontend/playwright-report/
 frontend/test-results/
 frontend/.wrangler/
+*.tsbuildinfo
 
 # Application storage: keep the directory, never its contents
 storage/*
 !storage/.gitkeep
+
+# Local evaluation data and generated detailed reports
+evaluation/audio/
+evaluation/references/
+evaluation/*.jsonl
+!evaluation/manifest.example.jsonl
+evaluation/reports/*
+!evaluation/reports/.gitkeep
 
 # Editors and operating systems
 .idea/

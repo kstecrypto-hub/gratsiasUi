@@ -652,11 +652,14 @@ test("waiting analyses keep polling and link completed results to their saved jo
 });
 
 test("call detail accepts backend aliases, highlights matches, and seeks authenticated audio", async ({ page }) => {
+  let callDetailJobId: string | null = null;
   await page.addInitScript(() => {
     Object.defineProperty(HTMLMediaElement.prototype, "play", { configurable: true, value: () => Promise.resolve() });
   });
   await mockApi(page, async (_page, request) => {
-    if (request.method === "GET" && request.pathname === "/calls/call-1") return { body: {
+    if (request.method === "GET" && request.pathname === "/calls/call-1") {
+      callDetailJobId = new URLSearchParams(request.search).get("job_id");
+      return { body: {
       id: "call-1",
       started_at: "2026-07-01T06:00:00Z",
       caller_number: "+302101234567",
@@ -672,10 +675,12 @@ test("call detail accepts backend aliases, highlights matches, and seeks authent
         matches: [{ id: "match-1", keyword_id: "keyword-1", keyword: "προσφορά", category: "Sales", original_matched_text: "προσφορά", context_before: "για την", context_after: "σήμερα", start_seconds: "12.5", end_seconds: "13.1", match_method: "exact_phrase", match_score: "1" }],
       }],
       processing_history: [],
-    } };
+      } };
+    }
     if (request.method === "GET" && request.pathname === "/calls/call-1/audio") return { body: "", contentType: "audio/mpeg" };
   });
   await page.goto("/calls/call-1?job_id=job-current&transcript_query=refund");
+  await expect.poll(() => callDetailJobId).toBe("job-current");
   await expect(page.getByText("+302101234567")).toBeVisible();
   await expect(page.locator("mark")).toHaveText("προσφορά");
   const audio = page.locator("audio");
@@ -683,4 +688,166 @@ test("call detail accepts backend aliases, highlights matches, and seeks authent
   await expect(page.getByRole("link", { name: "Back to results" })).toHaveAttribute("href", "/results?job_id=job-current&transcript_query=refund");
   await page.getByRole("button", { name: "Play recording from 0:13" }).click();
   await expect.poll(() => audio.evaluate((element: HTMLAudioElement) => element.currentTime)).toBeCloseTo(12.5, 1);
+});
+
+test("call detail shows speaker-assignment controls for unknown dual-channel transcripts", async ({ page }) => {
+  await mockApi(page, async (_page, request) => {
+    if (request.method === "GET" && request.pathname === "/calls/assign-unknown") return { body: {
+      id: "assign-unknown",
+      transcript_id: "transcript-assign",
+      started_at: "2026-07-01T06:00:00Z",
+      direction: "inbound",
+      processing_status: "completed",
+      transcription_mode: "dual_channel",
+      speaker_attribution_status: "channel_unknown",
+      speaker_assignment_required: true,
+      available_channels: [0, 1],
+      participants: [{ operator_id: 7, operator_name: "Maria", extension: "204" }],
+      transcript_segments: [
+        { id: "segment-0", speaker_label: "Channel A", speaker_source: "unknown", channel_index: 0, start_seconds: 0, end_seconds: 5, original_text: "hello" },
+        { id: "segment-1", speaker_label: "Channel B", speaker_source: "unknown", channel_index: 1, start_seconds: 5, end_seconds: 10, original_text: "world" },
+      ],
+      processing_history: [],
+    } };
+  });
+
+  await page.goto("/calls/assign-unknown");
+  await expect(page.getByText("The operator channel could not be identified automatically.")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Operator is Channel A" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Operator is Channel B" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Leave unassigned" })).toBeVisible();
+});
+
+test("call detail hides speaker-assignment controls for mono diarization", async ({ page }) => {
+  await mockApi(page, async (_page, request) => {
+    if (request.method === "GET" && request.pathname === "/calls/mono") return { body: {
+      id: "mono",
+      started_at: "2026-07-01T06:00:00Z",
+      direction: "inbound",
+      processing_status: "completed",
+      transcription_mode: "mono_diarization",
+      speaker_attribution_status: "anonymous_diarization",
+      speaker_assignment_required: false,
+      available_channels: [],
+      transcript_segments: [],
+      processing_history: [],
+    } };
+  });
+
+  await page.goto("/calls/mono");
+  await expect(page.getByText("No transcript is available")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Operator is Channel A" })).toHaveCount(0);
+  await expect(page.getByText("The operator channel could not be identified automatically.")).toHaveCount(0);
+});
+
+test("speaker assignment sends the selected channel and reloads the call", async ({ page }) => {
+  let submitted: Record<string, unknown> | undefined;
+  let getRequests = 0;
+  await mockApi(page, async (_page, request) => {
+    if (request.method === "GET" && request.pathname === "/calls/assign-send") {
+      getRequests += 1;
+      return { body: {
+        id: "assign-send",
+        transcript_id: "transcript-assign",
+        started_at: "2026-07-01T06:00:00Z",
+        direction: "inbound",
+        processing_status: "completed",
+        transcription_mode: "dual_channel",
+        speaker_attribution_status: "channel_unknown",
+        speaker_assignment_required: true,
+        available_channels: [0, 1],
+        participants: [{ operator_id: 7, operator_name: "Maria", extension: "204" }],
+        transcript_segments: [],
+        processing_history: [],
+      } };
+    }
+    if (request.method === "PATCH" && request.pathname === "/calls/assign-send/speaker-assignment") {
+      submitted = request.body as Record<string, unknown>;
+      return { body: {
+        transcript_id: "transcript-assign",
+        transcription_mode: "dual_channel",
+        speaker_attribution_status: "manually_assigned",
+        speaker_assignment_required: false,
+        available_channels: [0, 1],
+        operator_id: 7,
+        operator_channel_index: 1,
+      } };
+    }
+  });
+
+  await page.goto("/calls/assign-send");
+  await expect(page.getByRole("button", { name: "Operator is Channel B" })).toBeEnabled();
+  await page.getByRole("button", { name: "Operator is Channel B" }).click();
+  await expect.poll(() => submitted).toEqual({
+    transcript_id: "transcript-assign",
+    operator_id: "7",
+    operator_channel_index: 1,
+  });
+  await expect.poll(() => getRequests).toBeGreaterThan(1);
+});
+
+test("speaker assignment surfaces backend errors without reloading", async ({ page }) => {
+  let getRequests = 0;
+  await mockApi(page, async (_page, request) => {
+    if (request.method === "GET" && request.pathname === "/calls/assign-error") {
+      getRequests += 1;
+      return { body: {
+        id: "assign-error",
+        transcript_id: "transcript-assign",
+        started_at: "2026-07-01T06:00:00Z",
+        direction: "inbound",
+        processing_status: "completed",
+        transcription_mode: "dual_channel",
+        speaker_attribution_status: "channel_unknown",
+        speaker_assignment_required: true,
+        available_channels: [0, 1],
+        participants: [{ operator_id: 7, operator_name: "Maria", extension: "204" }],
+        transcript_segments: [],
+        processing_history: [],
+      } };
+    }
+    if (request.method === "PATCH" && request.pathname === "/calls/assign-error/speaker-assignment") {
+      return { status: 409, body: { detail: "The selected operator was not part of this call." } };
+    }
+  });
+
+  await page.goto("/calls/assign-error");
+  await expect(page.getByRole("button", { name: "Operator is Channel A" })).toBeEnabled();
+  const beforeErrorRequests = getRequests;
+  await page.getByRole("button", { name: "Operator is Channel A" }).click();
+  await expect(page.getByText("The selected operator was not part of this call.")).toBeVisible();
+  expect(getRequests).toBe(beforeErrorRequests);
+});
+
+test("existing manual assignment asks for confirmation before reassignment", async ({ page }) => {
+  let patchRequests = 0;
+  await mockApi(page, async (_page, request) => {
+    if (request.method === "GET" && request.pathname === "/calls/assign-confirm") return { body: {
+      id: "assign-confirm",
+      transcript_id: "transcript-assign",
+      started_at: "2026-07-01T06:00:00Z",
+      direction: "inbound",
+      processing_status: "completed",
+      transcription_mode: "dual_channel",
+      speaker_attribution_status: "manually_assigned",
+      speaker_assignment_required: false,
+      available_channels: [0, 1],
+      participants: [{ operator_id: 7, operator_name: "Maria", extension: "204" }],
+      transcript_segments: [],
+      processing_history: [],
+    } };
+    if (request.method === "PATCH" && request.pathname === "/calls/assign-confirm/speaker-assignment") {
+      patchRequests += 1;
+      return { body: {} };
+    }
+  });
+
+  await page.goto("/calls/assign-confirm");
+  await page.once("dialog", (dialog) => dialog.dismiss());
+  await page.getByRole("button", { name: "Operator is Channel B" }).click();
+  await expect.poll(() => patchRequests).toBe(0);
+
+  await page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Operator is Channel B" }).click();
+  await expect.poll(() => patchRequests).toBe(1);
 });

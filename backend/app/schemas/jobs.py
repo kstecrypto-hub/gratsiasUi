@@ -53,6 +53,8 @@ class JobItemResponse(APIModel):
     call_id: UUID
     operator_id: UUID
     recording_id: UUID | None
+    requested_pipeline_version: str | None = None
+    result_transcript_id: UUID | None = None
     status: str
     stage: str
     attempt_count: int

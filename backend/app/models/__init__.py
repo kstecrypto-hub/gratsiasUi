@@ -16,6 +16,7 @@ from app.models.entities import (
     SyncRun,
     Transcript,
     TranscriptSegment,
+    TranscriptionAttempt,
     User,
 )
 from app.models.enums import *  # noqa: F403
@@ -38,5 +39,6 @@ __all__ = [
     "SyncRun",
     "Transcript",
     "TranscriptSegment",
+    "TranscriptionAttempt",
     "User",
 ]

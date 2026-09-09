@@ -158,12 +158,14 @@ def _job_item(
     status: ItemStatus,
     updated_at: datetime,
     recording: Recording | None = None,
+    result_transcript_id: UUID | None = None,
 ) -> ProcessingJobItem:
     return ProcessingJobItem(
         job_id=job.id,
         call_id=call.id,
         operator_id=operator.id,
         recording_id=recording.id if recording else None,
+        result_transcript_id=result_transcript_id,
         idempotency_key=f"item-{uuid4()}",
         status=status,
         stage=status.value,
@@ -294,6 +296,10 @@ async def test_results_status_is_latest_per_call_operator_and_dashboard_failures
             operators=[operator_a, operator_b],
             created_at=now - timedelta(minutes=5),
         )
+        # This fixture intentionally treats the unattributed diarized segment
+        # as shared call context for both selected operators.
+        old_job.include_all_speakers = True
+        new_job.include_all_speakers = True
         session.add_all(
             [
                 _job_item(
@@ -309,6 +315,7 @@ async def test_results_status_is_latest_per_call_operator_and_dashboard_failures
                     operator=operator_b,
                     status=ItemStatus.COMPLETED,
                     updated_at=now - timedelta(minutes=10),
+                    result_transcript_id=transcript.id,
                 ),
                 _job_item(
                     job=new_job,
@@ -316,6 +323,7 @@ async def test_results_status_is_latest_per_call_operator_and_dashboard_failures
                     operator=operator_a,
                     status=ItemStatus.COMPLETED,
                     updated_at=now - timedelta(minutes=5),
+                    result_transcript_id=transcript.id,
                 ),
                 _job_item(
                     job=new_job,
@@ -617,6 +625,7 @@ async def test_completed_transcript_is_reused_before_audio_or_provider_access(
     monkeypatch.setattr(pipeline, "AudioProcessor", GuardAudioProcessor)
     monkeypatch.setattr(pipeline, "YeastarClient", ForbiddenProviderClient)
     monkeypatch.setattr(pipeline, "OpenAITranscriptionClient", ForbiddenProviderClient)
+    monkeypatch.setattr(pipeline, "TranscriptionOrchestrator", ForbiddenProviderClient)
 
     await pipeline.process_item(item_id)
 
@@ -629,6 +638,4 @@ async def test_completed_transcript_is_reused_before_audio_or_provider_access(
         assert completed_item is not None
         assert completed_item.status == ItemStatus.COMPLETED
         assert completed_item.attempt_count == 1
-        assert (
-            await session.scalar(select(func.count()).select_from(Transcript)) or 0
-        ) == 1
+        assert (await session.scalar(select(func.count()).select_from(Transcript)) or 0) == 1

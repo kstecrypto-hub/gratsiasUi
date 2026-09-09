@@ -17,6 +17,7 @@ from sqlalchemy import (
     Index,
     Integer,
     Numeric,
+    SmallInteger,
     String,
     Text,
     UniqueConstraint,
@@ -34,8 +35,10 @@ from app.models.enums import (
     RecordingStatus,
     RunStatus,
     Severity,
+    SpeakerAttributionStatus,
     SpeakerSource,
     SyncType,
+    TranscriptionMode,
     TranscriptStatus,
     YeastarConnectionStatus,
 )
@@ -94,7 +97,9 @@ class Call(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     yeastar_uid: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     yeastar_id: Mapped[str | None] = mapped_column(String(255), index=True)
-    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
     answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     caller_number: Mapped[str | None] = mapped_column(String(128))
@@ -109,7 +114,9 @@ class Call(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     queue_name: Mapped[str | None] = mapped_column(String(255), index=True)
     has_recording: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
     was_transferred: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    processing_status: Mapped[str] = mapped_column(String(64), nullable=False, default="pending", index=True)
+    processing_status: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="pending", index=True
+    )
     last_error_category: Mapped[str | None] = mapped_column(String(128))
     last_error_message: Mapped[str | None] = mapped_column(String(1000))
     provider_payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
@@ -121,7 +128,9 @@ class Call(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     recordings: Mapped[list[Recording]] = relationship(
         back_populates="call", cascade="all, delete-orphan"
     )
-    transcripts: Mapped[list[Transcript]] = relationship(back_populates="call")
+    transcripts: Mapped[list[Transcript]] = relationship(
+        back_populates="call", passive_deletes="all"
+    )
 
 
 class CallLeg(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -167,7 +176,11 @@ class CallParticipant(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "call_participants"
     __table_args__ = (
         UniqueConstraint(
-            "call_id", "operator_id", "call_leg_id", "role", name="uq_participant_call_operator_leg_role"
+            "call_id",
+            "operator_id",
+            "call_leg_id",
+            "role",
+            name="uq_participant_call_operator_leg_role",
         ),
     )
 
@@ -247,7 +260,9 @@ class Recording(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     last_error_message: Mapped[str | None] = mapped_column(String(1000))
 
     call: Mapped[Call] = relationship(back_populates="recordings")
-    transcripts: Mapped[list[Transcript]] = relationship(back_populates="recording")
+    transcripts: Mapped[list[Transcript]] = relationship(
+        back_populates="recording", passive_deletes="all"
+    )
 
 
 class IntegrationStatus(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -271,9 +286,7 @@ class IntegrationStatus(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     provider_timestamp: Mapped[int | None] = mapped_column(BigInteger)
     capabilities_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     last_tested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    last_successful_connection_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True)
-    )
+    last_successful_connection_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error_category: Mapped[str | None] = mapped_column(String(128))
     last_error_reference: Mapped[str | None] = mapped_column(String(128))
 
@@ -361,6 +374,10 @@ class ProcessingJobItem(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         ForeignKey("recordings.id", ondelete="SET NULL"), index=True
     )
     idempotency_key: Mapped[str] = mapped_column(String(160), nullable=False, unique=True)
+    requested_pipeline_version: Mapped[str | None] = mapped_column(String(64))
+    result_transcript_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("transcripts.id", ondelete="SET NULL"), index=True
+    )
     status: Mapped[ItemStatus] = mapped_column(
         enum_column(ItemStatus, "processing_job_item_status"),
         nullable=False,
@@ -384,6 +401,27 @@ class ProcessingJobItem(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
 class Transcript(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "transcripts"
+    __table_args__ = (
+        CheckConstraint(
+            "supersedes_transcript_id IS NULL OR supersedes_transcript_id <> id",
+            name="transcript_not_self_superseding",
+        ),
+        Index(
+            "uq_transcripts_current_attributed",
+            "recording_id",
+            "operator_id",
+            unique=True,
+            postgresql_where=text("is_current IS TRUE AND operator_id IS NOT NULL"),
+            sqlite_where=text("is_current = 1 AND operator_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_transcripts_current_unattributed",
+            "recording_id",
+            unique=True,
+            postgresql_where=text("is_current IS TRUE AND operator_id IS NULL"),
+            sqlite_where=text("is_current = 1 AND operator_id IS NULL"),
+        ),
+    )
 
     call_id: Mapped[UUID] = mapped_column(
         ForeignKey("calls.id", ondelete="CASCADE"), nullable=False, index=True
@@ -404,6 +442,8 @@ class Transcript(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     model: Mapped[str] = mapped_column(String(128), nullable=False)
     language: Mapped[str] = mapped_column(String(16), nullable=False, default="el")
     prompt_version: Mapped[str | None] = mapped_column(String(64))
+    prompt_template_version: Mapped[str | None] = mapped_column(String(64))
+    vocabulary_hash: Mapped[str | None] = mapped_column(String(64))
     processing_duration_seconds: Mapped[float | None] = mapped_column(Float)
     audio_duration_seconds: Mapped[float | None] = mapped_column(Float)
     api_usage: Mapped[dict[str, Any] | None] = mapped_column(JSON)
@@ -413,6 +453,26 @@ class Transcript(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     source_audio_sha256: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     is_diarized: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    transcription_mode: Mapped[TranscriptionMode | None] = mapped_column(
+        enum_column(TranscriptionMode, "transcription_mode"),
+        default=TranscriptionMode.LEGACY,
+        server_default=text("'LEGACY'"),
+    )
+    speaker_attribution_status: Mapped[SpeakerAttributionStatus | None] = mapped_column(
+        enum_column(SpeakerAttributionStatus, "speaker_attribution_status")
+    )
+    pipeline_version: Mapped[str | None] = mapped_column(
+        String(64), default="legacy-v1", server_default=text("'legacy-v1'")
+    )
+    pipeline_config_hash: Mapped[str | None] = mapped_column(String(64))
+    preprocessing_profile: Mapped[str | None] = mapped_column(String(128))
+    quality_summary: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    supersedes_transcript_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("transcripts.id", ondelete="SET NULL"), index=True
+    )
+    is_current: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=text("true")
+    )
     original_text: Mapped[str | None] = mapped_column(Text)
     normalized_text: Mapped[str | None] = mapped_column(Text)
 
@@ -420,7 +480,15 @@ class Transcript(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     recording: Mapped[Recording] = relationship(back_populates="transcripts")
     operator: Mapped[Operator | None] = relationship()
     segments: Mapped[list[TranscriptSegment]] = relationship(
-        back_populates="transcript", cascade="all, delete-orphan", order_by="TranscriptSegment.sequence_number"
+        back_populates="transcript",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="TranscriptSegment.sequence_number",
+    )
+    attempts: Mapped[list[TranscriptionAttempt]] = relationship(
+        back_populates="transcript",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
     )
 
 
@@ -429,6 +497,18 @@ class TranscriptSegment(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __table_args__ = (
         UniqueConstraint("transcript_id", "sequence_number", name="uq_segment_transcript_sequence"),
         CheckConstraint("end_seconds >= start_seconds", name="segment_time_order"),
+        CheckConstraint(
+            "channel_index IS NULL OR channel_index >= 0",
+            name="segment_channel_index_nonnegative",
+        ),
+        CheckConstraint(
+            "chunk_index IS NULL OR chunk_index >= 0",
+            name="segment_chunk_index_nonnegative",
+        ),
+        CheckConstraint(
+            "low_logprob_ratio IS NULL OR (low_logprob_ratio >= 0 AND low_logprob_ratio <= 1)",
+            name="segment_low_logprob_ratio_range",
+        ),
     )
 
     transcript_id: Mapped[UUID] = mapped_column(
@@ -454,9 +534,70 @@ class TranscriptSegment(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     confidence: Mapped[Decimal | None] = mapped_column(Numeric(6, 5))
     transcription_model: Mapped[str] = mapped_column(String(128), nullable=False)
     sequence_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    channel_index: Mapped[int | None] = mapped_column(SmallInteger)
+    track_id: Mapped[str | None] = mapped_column(String(128))
+    chunk_index: Mapped[int | None] = mapped_column(Integer)
+    mean_logprob: Mapped[Decimal | None] = mapped_column(Numeric(8, 5))
+    low_logprob_ratio: Mapped[Decimal | None] = mapped_column(Numeric(6, 5))
+    quality_flags: Mapped[list[str]] = mapped_column(
+        JSON, nullable=False, default=list, server_default=text("'[]'")
+    )
+    audio_variant: Mapped[str | None] = mapped_column(String(128))
 
     transcript: Mapped[Transcript] = relationship(back_populates="segments")
-    matches: Mapped[list[KeywordMatch]] = relationship(back_populates="segment")
+    matches: Mapped[list[KeywordMatch]] = relationship(
+        back_populates="segment",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+
+class TranscriptionAttempt(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "transcription_attempts"
+    __table_args__ = (
+        CheckConstraint("end_seconds >= start_seconds", name="attempt_time_order"),
+        CheckConstraint("chunk_index >= 0", name="attempt_chunk_index_nonnegative"),
+        CheckConstraint(
+            "low_logprob_ratio IS NULL OR (low_logprob_ratio >= 0 AND low_logprob_ratio <= 1)",
+            name="attempt_low_logprob_ratio_range",
+        ),
+        Index(
+            "ix_transcription_attempts_transcript_track_chunk",
+            "transcript_id",
+            "track_id",
+            "chunk_index",
+        ),
+        Index(
+            "uq_transcription_attempts_selected_chunk",
+            "transcript_id",
+            "track_id",
+            "chunk_index",
+            unique=True,
+            postgresql_where=text("selected IS TRUE"),
+            sqlite_where=text("selected = 1"),
+        ),
+    )
+
+    transcript_id: Mapped[UUID] = mapped_column(
+        ForeignKey("transcripts.id", ondelete="CASCADE"), nullable=False
+    )
+    track_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    start_seconds: Mapped[Decimal] = mapped_column(Numeric(12, 3), nullable=False)
+    end_seconds: Mapped[Decimal] = mapped_column(Numeric(12, 3), nullable=False)
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    audio_variant: Mapped[str] = mapped_column(String(128), nullable=False)
+    prompt_hash: Mapped[str | None] = mapped_column(String(64))
+    response_text: Mapped[str | None] = mapped_column(Text)
+    mean_logprob: Mapped[Decimal | None] = mapped_column(Numeric(8, 5))
+    low_logprob_ratio: Mapped[Decimal | None] = mapped_column(Numeric(6, 5))
+    selected: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    api_usage: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    transcript: Mapped[Transcript] = relationship(back_populates="attempts")
 
 
 class KeywordCategory(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -591,16 +732,16 @@ class ApplicationSetting(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     key: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
     value: Mapped[Any] = mapped_column(JSON, nullable=False)
-    updated_by_id: Mapped[UUID | None] = mapped_column(
-        ForeignKey("users.id", ondelete="SET NULL")
-    )
+    updated_by_id: Mapped[UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
 
 
 class AuditLog(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "audit_logs"
     __table_args__ = (Index("ix_audit_logs_created_action", "created_at", "action"),)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
     user_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), index=True
     )

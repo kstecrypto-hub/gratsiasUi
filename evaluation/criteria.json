@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "confirmed_stereo_attribution_accuracy": 1.0,
+  "relative_wer_improvement_pct": 10.0,
+  "max_cohort_wer_regression_abs": 2.0,
+  "keyword_recall_not_worse": true,
+  "keyword_fpr_increase_abs_pct": 1.0,
+  "processing_success_rate_drop_pct": 1.0
+}

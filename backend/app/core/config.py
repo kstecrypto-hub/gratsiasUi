@@ -120,6 +120,8 @@ class Settings(BaseSettings):
     OPENAI_TRANSCRIPTION_MODEL: str = "gpt-4o-transcribe"
     OPENAI_DIARIZATION_MODEL: str = "gpt-4o-transcribe-diarize"
     TRANSCRIPTION_LANGUAGE: str = "el"
+    TRANSCRIPTION_PIPELINE_DEFAULT: Literal["legacy-v1", "pipeline-v2"] = "legacy-v1"
+    TRANSCRIPTION_PIPELINE_V2_ENABLED: bool = False
 
     DATABASE_URL: str = "postgresql+psycopg://app:app@postgres:5432/yeastar"
     REDIS_URL: str = "redis://redis:6379/0"

@@ -233,7 +233,15 @@ class YeastarClient:
         return True
 
     async def stereo_separated_recording_enabled(self) -> bool:
-        cache_key = "yca:yeastar:stereo-capability:v1"
+        # The capability belongs to one PBX configuration.  A global cache key
+        # could falsely apply the previous PBX's channel layout after the UI
+        # configuration is replaced.
+        fingerprint = self.settings.yeastar_configuration_fingerprint
+        if not fingerprint:
+            raise YeastarConfigurationError(
+                "Phone-system configuration is incomplete."
+            )
+        cache_key = f"yca:yeastar:stereo-capability:v2:{fingerprint}"
         cached = await self.redis.get(cache_key)
         if cached in {b"0", b"1", "0", "1"}:
             return cached in {b"1", "1"}

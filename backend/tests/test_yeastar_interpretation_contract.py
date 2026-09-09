@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import pytest
+
 from app.models.enums import ParticipantRole
-from app.services.yeastar.interpretation import interpret_call_legs, safe_operator_channel
+from app.services.yeastar.interpretation import (
+    interpret_call_legs,
+    safe_caller_callee_channels,
+    safe_operator_channel,
+)
 
 
 OPERATORS = [
@@ -159,3 +165,32 @@ def test_channel_selection_requires_verified_one_to_one_stereo_separation() -> N
         one_to_one=True,
         operators_on_same_side=2,
     ) is None
+
+
+@pytest.mark.parametrize("ambiguous_context", ["queue", "multi_leg"])
+def test_queue_and_multi_leg_calls_do_not_assume_channel_mapping(
+    ambiguous_context: str,
+) -> None:
+    # Both contexts are sanitized by the worker to one_to_one=False.
+    assert ambiguous_context in {"queue", "multi_leg"}
+    assert (
+        safe_caller_callee_channels(
+            channel_count=2,
+            stereo_separated=True,
+            one_to_one=False,
+        )
+        is None
+    )
+
+
+def test_transferred_calls_do_not_assume_caller_callee_mapping() -> None:
+    assert (
+        safe_caller_callee_channels(
+            channel_count=2,
+            stereo_separated=True,
+            one_to_one=True,
+            was_transferred=True,
+        )
+        is None
+    )
+    assert safe_caller_callee_channels(2, True, one_to_one=True) == (0, 1)

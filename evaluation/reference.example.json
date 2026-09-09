@@ -1,0 +1,35 @@
+{
+  "id": "call-001",
+  "quality": "noisy_mobile",
+  "mode": "stereo",
+  "split": "test",
+  "expected_keywords": [
+    "προσφορά",
+    "ραντεβού"
+  ],
+  "segments": [
+    {
+      "speaker": "Operator",
+      "channel": 0,
+      "start": 0.0,
+      "end": 3.2,
+      "text": "Καλημέρα, πώς μπορώ να σας εξυπηρετήσω;",
+      "entities": {
+        "names": []
+      }
+    },
+    {
+      "speaker": "Customer",
+      "channel": 1,
+      "start": 3.5,
+      "end": 8.1,
+      "text": "Θα ήθελα να κλείσω ένα ραντεβού για service.",
+      "entities": {
+        "names": [],
+        "telephone_numbers": ["2100000000"],
+        "licence_plates": ["ABC-1234"],
+        "vehicle_models": ["Corolla"]
+      }
+    }
+  ]
+}

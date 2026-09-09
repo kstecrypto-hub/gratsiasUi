@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import logging
 from collections import defaultdict
 from collections.abc import Iterator
 from datetime import UTC, date, datetime, time, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID, uuid4
@@ -10,10 +13,11 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import and_, distinct, exists, func, not_, or_, select
+from sqlalchemy import and_, delete, distinct, exists, func, not_, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import aliased, selectinload
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.api.jobs import (
     FINAL_ITEM_STATUSES,
@@ -21,9 +25,10 @@ from app.api.jobs import (
     _require_integrations,
     active_job,
     active_job_conflict,
+    job_detail,
     job_summary,
 )
-from app.api.dependencies import EffectiveYeastarSettings
+from app.api.dependencies import EffectiveRuntimeSettings, EffectiveYeastarSettings
 from app.auth.dependencies import CurrentUser
 from app.core.config import get_settings
 from app.core.time import utc_now
@@ -41,25 +46,40 @@ from app.models import (
     Transcript,
     TranscriptSegment,
 )
-from app.models.enums import Direction, ItemStatus, JobStatus, TranscriptStatus
+from app.models.enums import (
+    Direction,
+    ItemStatus,
+    JobStatus,
+    SpeakerAttributionStatus,
+    SpeakerSource,
+    TranscriptionMode,
+    TranscriptStatus,
+)
 from app.schemas.common import MessageResponse, Page
+from app.schemas.jobs import JobDetail
 from app.schemas.results import (
+    CallReprocessRequest,
     CallDetailResponse,
     DashboardResponse,
     MatchResponse,
     ResultItem,
+    SpeakerAssignmentRequest,
+    SpeakerAssignmentResponse,
+    TranscriptQualitySummaryResponse,
     TranscriptSegmentResponse,
 )
 from app.services.audit import audit
 from app.services.application_settings import load_application_settings
 from app.services.audio import AudioProcessor
 from app.services.export import csv_bytes, mask_phone_number
+from app.services.keyword_matching import KeywordDefinition, match_text
 from app.services.keyword_matching.normalization import normalize_greek
 from app.services.yeastar import YeastarClient
 from app.workers.tasks import process_job_item
 
 
 router = APIRouter(tags=["results"])
+logger = logging.getLogger(__name__)
 
 
 def _external_number(call: Call) -> str | None:
@@ -133,26 +153,38 @@ async def dashboard(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> DashboardResponse:
     calls_analyzed = await db.scalar(select(func.count()).select_from(Call)) or 0
-    calls_with_recordings = await db.scalar(
-        select(func.count()).select_from(Call).where(Call.has_recording.is_(True))
-    ) or 0
-    calls_transcribed = await db.scalar(
-        select(func.count(distinct(Transcript.call_id))).where(
-            Transcript.status == TranscriptStatus.COMPLETED
+    calls_with_recordings = (
+        await db.scalar(select(func.count()).select_from(Call).where(Call.has_recording.is_(True)))
+        or 0
+    )
+    calls_transcribed = (
+        await db.scalar(
+            select(func.count(distinct(Transcript.call_id))).where(
+                Transcript.status == TranscriptStatus.COMPLETED,
+                Transcript.is_current.is_(True),
+            )
         )
-    ) or 0
-    calls_with_matches = await db.scalar(
-        select(func.count(distinct(KeywordMatch.call_id)))
-    ) or 0
+        or 0
+    )
+    calls_with_matches = (
+        await db.scalar(
+            select(func.count(distinct(KeywordMatch.call_id)))
+            .join(TranscriptSegment, TranscriptSegment.id == KeywordMatch.transcript_segment_id)
+            .join(Transcript, Transcript.id == TranscriptSegment.transcript_id)
+            .where(
+                Transcript.status == TranscriptStatus.COMPLETED,
+                Transcript.is_current.is_(True),
+            )
+        )
+        or 0
+    )
     failed_call_ids = (
         select(ProcessingJobItem.call_id.label("call_id"))
         .where(ProcessingJobItem.status == ItemStatus.FAILED)
         .union(select(Call.id.label("call_id")).where(Call.processing_status == "failed"))
         .subquery()
     )
-    failed_calls = await db.scalar(
-        select(func.count()).select_from(failed_call_ids)
-    ) or 0
+    failed_calls = await db.scalar(select(func.count()).select_from(failed_call_ids)) or 0
     processing_jobs = await db.scalar(select(func.count()).select_from(ProcessingJob)) or 0
     recent_jobs = (
         await db.scalars(
@@ -170,6 +202,12 @@ async def dashboard(
                 func.count(KeywordMatch.id).label("match_count"),
             )
             .join(KeywordMatch, KeywordMatch.operator_id == Operator.id)
+            .join(TranscriptSegment, TranscriptSegment.id == KeywordMatch.transcript_segment_id)
+            .join(Transcript, Transcript.id == TranscriptSegment.transcript_id)
+            .where(
+                Transcript.status == TranscriptStatus.COMPLETED,
+                Transcript.is_current.is_(True),
+            )
             .group_by(Operator.id, Operator.display_name)
             .order_by(func.count(KeywordMatch.id).desc())
             .limit(20)
@@ -185,6 +223,12 @@ async def dashboard(
             )
             .join(Keyword, Keyword.category_id == KeywordCategory.id)
             .join(KeywordMatch, KeywordMatch.keyword_id == Keyword.id)
+            .join(TranscriptSegment, TranscriptSegment.id == KeywordMatch.transcript_segment_id)
+            .join(Transcript, Transcript.id == TranscriptSegment.transcript_id)
+            .where(
+                Transcript.status == TranscriptStatus.COMPLETED,
+                Transcript.is_current.is_(True),
+            )
             .group_by(KeywordCategory.id, KeywordCategory.name)
             .order_by(func.count(KeywordMatch.id).desc())
             .limit(20)
@@ -219,8 +263,7 @@ async def dashboard(
             for row in category_rows
         ],
         recent_jobs=[
-            job_summary(job, is_current=index == 0)
-            for index, job in enumerate(recent_jobs)
+            job_summary(job, is_current=index == 0) for index, job in enumerate(recent_jobs)
         ],
     )
 
@@ -228,6 +271,7 @@ async def dashboard(
 def _result_query(
     *,
     job_id: UUID,
+    include_all_speakers: bool,
     date_from: datetime | None,
     date_to: datetime | None,
     operator_id: UUID | None,
@@ -263,39 +307,77 @@ def _result_query(
         conditions.append(Call.direction == Direction(direction.lower()))
     if transcript_query:
         escaped_query = (
-            transcript_query.replace("\\", "\\\\")
-            .replace("%", "\\%")
-            .replace("_", "\\_")
+            transcript_query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+        transcript_speaker_scope = (
+            or_(
+                TranscriptSegment.operator_id == Operator.id,
+                TranscriptSegment.operator_id.is_(None),
+            )
+            if include_all_speakers
+            else TranscriptSegment.operator_id == Operator.id
         )
         transcript_matches = (
             select(TranscriptSegment.id)
             .join(Transcript, Transcript.id == TranscriptSegment.transcript_id)
-            .where(
-                TranscriptSegment.call_id == Call.id,
-                Transcript.status == TranscriptStatus.COMPLETED,
-                or_(
-                    TranscriptSegment.operator_id == Operator.id,
-                    and_(
-                        TranscriptSegment.operator_id.is_(None),
-                        Transcript.operator_id == Operator.id,
-                    ),
-                    and_(
-                        TranscriptSegment.operator_id.is_(None),
+            .join(
+                ProcessingJobItem,
+                and_(
+                    ProcessingJobItem.job_id == job_id,
+                    ProcessingJobItem.call_id == Call.id,
+                    ProcessingJobItem.result_transcript_id == Transcript.id,
+                    or_(
+                        ProcessingJobItem.operator_id == Operator.id,
                         Transcript.operator_id.is_(None),
                     ),
                 ),
-                TranscriptSegment.normalized_text.ilike(
-                    f"%{escaped_query}%", escape="\\"
-                ),
+            )
+            .where(
+                TranscriptSegment.call_id == Call.id,
+                Transcript.status == TranscriptStatus.COMPLETED,
+                transcript_speaker_scope,
+                TranscriptSegment.normalized_text.ilike(f"%{escaped_query}%", escape="\\"),
             )
         )
         conditions.append(exists(transcript_matches))
-    matching = select(KeywordMatch.id).where(
-        KeywordMatch.call_id == Call.id,
-        or_(
+    match_speaker_scope = (
+        and_(
+            or_(
+                KeywordMatch.operator_id == Operator.id,
+                KeywordMatch.operator_id.is_(None),
+            ),
+            or_(
+                TranscriptSegment.operator_id == Operator.id,
+                TranscriptSegment.operator_id.is_(None),
+            ),
+        )
+        if include_all_speakers
+        else and_(
             KeywordMatch.operator_id == Operator.id,
-            KeywordMatch.operator_id.is_(None),
-        ),
+            TranscriptSegment.operator_id == Operator.id,
+        )
+    )
+    matching = (
+        select(KeywordMatch.id)
+        .join(TranscriptSegment, TranscriptSegment.id == KeywordMatch.transcript_segment_id)
+        .join(Transcript, Transcript.id == TranscriptSegment.transcript_id)
+        .join(
+            ProcessingJobItem,
+            and_(
+                ProcessingJobItem.job_id == job_id,
+                ProcessingJobItem.call_id == Call.id,
+                ProcessingJobItem.result_transcript_id == Transcript.id,
+                or_(
+                    ProcessingJobItem.operator_id == Operator.id,
+                    Transcript.operator_id.is_(None),
+                ),
+            ),
+        )
+        .where(
+            KeywordMatch.call_id == Call.id,
+            Transcript.status == TranscriptStatus.COMPLETED,
+            match_speaker_scope,
+        )
     )
     if keyword_id or keyword or category_id:
         matching = matching.join(Keyword, Keyword.id == KeywordMatch.keyword_id)
@@ -317,6 +399,8 @@ async def _matches_for_pairs(
     db: AsyncSession,
     pairs: list[tuple[Call, Operator]],
     *,
+    job_id: UUID,
+    include_all_speakers: bool,
     keyword_id: UUID | None = None,
     keyword_text: str | None = None,
     category_id: UUID | None = None,
@@ -325,17 +409,71 @@ async def _matches_for_pairs(
         return {}
     call_ids = {call.id for call, _ in pairs}
     operator_ids = {operator.id for _, operator in pairs}
+    target_item = aliased(ProcessingJobItem, name="result_target_item")
+    source_item = aliased(ProcessingJobItem, name="result_source_item")
+    bindings = (
+        select(
+            source_item.result_transcript_id.label("transcript_id"),
+            target_item.call_id.label("call_id"),
+            target_item.operator_id.label("operator_id"),
+        )
+        .select_from(target_item)
+        .join(
+            source_item,
+            and_(
+                source_item.job_id == target_item.job_id,
+                source_item.call_id == target_item.call_id,
+                source_item.result_transcript_id.is_not(None),
+            ),
+        )
+        .join(Transcript, Transcript.id == source_item.result_transcript_id)
+        .where(
+            target_item.job_id == job_id,
+            target_item.call_id.in_(call_ids),
+            target_item.operator_id.in_(operator_ids),
+            or_(
+                source_item.operator_id == target_item.operator_id,
+                Transcript.operator_id.is_(None),
+            ),
+        )
+        .distinct()
+        .subquery()
+    )
+    match_speaker_scope = (
+        and_(
+            or_(
+                KeywordMatch.operator_id == bindings.c.operator_id,
+                KeywordMatch.operator_id.is_(None),
+            ),
+            or_(
+                TranscriptSegment.operator_id == bindings.c.operator_id,
+                TranscriptSegment.operator_id.is_(None),
+            ),
+        )
+        if include_all_speakers
+        else and_(
+            KeywordMatch.operator_id == bindings.c.operator_id,
+            TranscriptSegment.operator_id == bindings.c.operator_id,
+        )
+    )
     query = (
-            select(KeywordMatch, Keyword, KeywordCategory)
-            .join(Keyword, Keyword.id == KeywordMatch.keyword_id)
-            .join(KeywordCategory, KeywordCategory.id == Keyword.category_id)
-            .where(
-                KeywordMatch.call_id.in_(call_ids),
-                or_(
-                    KeywordMatch.operator_id.in_(operator_ids),
-                    KeywordMatch.operator_id.is_(None),
-                ),
-            )
+        select(KeywordMatch, Keyword, KeywordCategory, bindings.c.operator_id)
+        .join(Keyword, Keyword.id == KeywordMatch.keyword_id)
+        .join(KeywordCategory, KeywordCategory.id == Keyword.category_id)
+        .join(TranscriptSegment, TranscriptSegment.id == KeywordMatch.transcript_segment_id)
+        .join(Transcript, Transcript.id == TranscriptSegment.transcript_id)
+        .join(
+            bindings,
+            and_(
+                bindings.c.transcript_id == Transcript.id,
+                bindings.c.call_id == KeywordMatch.call_id,
+            ),
+        )
+        .where(
+            Transcript.status == TranscriptStatus.COMPLETED,
+            KeywordMatch.call_id.in_(call_ids),
+            match_speaker_scope,
+        )
     )
     if keyword_id:
         query = query.where(Keyword.id == keyword_id)
@@ -346,16 +484,8 @@ async def _matches_for_pairs(
         query = query.where(Keyword.category_id == category_id)
     rows = (await db.execute(query.order_by(KeywordMatch.start_seconds))).all()
     grouped: dict[tuple[UUID, UUID], list] = defaultdict(list)
-    unknown_by_call: dict[UUID, list] = defaultdict(list)
-    for match, keyword, category in rows:
-        if match.operator_id is None:
-            unknown_by_call[match.call_id].append((match, keyword, category))
-        else:
-            grouped[(match.call_id, match.operator_id)].append((match, keyword, category))
-    for call, operator in pairs:
-        if unknown_by_call.get(call.id):
-            grouped[(call.id, operator.id)].extend(unknown_by_call[call.id])
-            grouped[(call.id, operator.id)].sort(key=lambda item: item[0].start_seconds)
+    for match, keyword, category, bound_operator_id in rows:
+        grouped[(match.call_id, bound_operator_id)].append((match, keyword, category))
     return grouped
 
 
@@ -370,8 +500,7 @@ async def _latest_item_statuses(
     if not keys:
         return {}
     conditions = [
-        (ProcessingJobItem.call_id == call_id)
-        & (ProcessingJobItem.operator_id == operator_id)
+        (ProcessingJobItem.call_id == call_id) & (ProcessingJobItem.operator_id == operator_id)
         for call_id, operator_id in keys
     ]
     items = (
@@ -392,9 +521,7 @@ async def _latest_item_statuses(
     return result
 
 
-async def _resolve_result_job(
-    db: AsyncSession, job_id: UUID | None
-) -> ProcessingJob | None:
+async def _resolve_result_job(db: AsyncSession, job_id: UUID | None) -> ProcessingJob | None:
     if job_id is not None:
         job = await db.get(ProcessingJob, job_id)
         if job is None:
@@ -412,16 +539,50 @@ async def _resolve_result_job(
 
 def _match_count_expression(
     *,
+    job_id: UUID,
+    include_all_speakers: bool,
     keyword_id: UUID | None,
     keyword: str | None,
     category_id: UUID | None,
 ):
-    query = select(func.count(KeywordMatch.id)).where(
-        KeywordMatch.call_id == Call.id,
-        or_(
+    match_speaker_scope = (
+        and_(
+            or_(
+                KeywordMatch.operator_id == Operator.id,
+                KeywordMatch.operator_id.is_(None),
+            ),
+            or_(
+                TranscriptSegment.operator_id == Operator.id,
+                TranscriptSegment.operator_id.is_(None),
+            ),
+        )
+        if include_all_speakers
+        else and_(
             KeywordMatch.operator_id == Operator.id,
-            KeywordMatch.operator_id.is_(None),
-        ),
+            TranscriptSegment.operator_id == Operator.id,
+        )
+    )
+    query = (
+        select(func.count(distinct(KeywordMatch.id)))
+        .join(TranscriptSegment, TranscriptSegment.id == KeywordMatch.transcript_segment_id)
+        .join(Transcript, Transcript.id == TranscriptSegment.transcript_id)
+        .join(
+            ProcessingJobItem,
+            and_(
+                ProcessingJobItem.job_id == job_id,
+                ProcessingJobItem.call_id == Call.id,
+                ProcessingJobItem.result_transcript_id == Transcript.id,
+                or_(
+                    ProcessingJobItem.operator_id == Operator.id,
+                    Transcript.operator_id.is_(None),
+                ),
+            ),
+        )
+        .where(
+            KeywordMatch.call_id == Call.id,
+            Transcript.status == TranscriptStatus.COMPLETED,
+            match_speaker_scope,
+        )
     )
     if keyword_id or keyword or category_id:
         query = query.join(Keyword, Keyword.id == KeywordMatch.keyword_id)
@@ -446,8 +607,7 @@ def _validate_match_filter_combination(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=(
-                "No-match filtering cannot be combined with a saved keyword "
-                "or keyword category."
+                "No-match filtering cannot be combined with a saved keyword or keyword category."
             ),
         )
 
@@ -494,6 +654,7 @@ async def results(
     normalized_transcript_query = _normalized_transcript_query(transcript_query)
     base = _result_query(
         job_id=job.id,
+        include_all_speakers=job.include_all_speakers,
         date_from=from_utc,
         date_to=to_utc,
         operator_id=operator_id,
@@ -506,6 +667,8 @@ async def results(
     )
     total = await db.scalar(select(func.count()).select_from(base.subquery())) or 0
     match_count_sort = _match_count_expression(
+        job_id=job.id,
+        include_all_speakers=job.include_all_speakers,
         keyword_id=keyword_id,
         keyword=keyword,
         category_id=category_id,
@@ -518,11 +681,15 @@ async def results(
     }[sort]
     sort_expression = sort_expression.asc() if order == "asc" else sort_expression.desc()
     pairs = (
-        await db.execute(base.order_by(sort_expression, Call.id).offset((page - 1) * page_size).limit(page_size))
+        await db.execute(
+            base.order_by(sort_expression, Call.id).offset((page - 1) * page_size).limit(page_size)
+        )
     ).all()
     grouped = await _matches_for_pairs(
         db,
         pairs,
+        job_id=job.id,
+        include_all_speakers=job.include_all_speakers,
         keyword_id=keyword_id,
         keyword_text=keyword,
         category_id=category_id,
@@ -541,11 +708,11 @@ async def results(
                 masked_phone_number=mask_phone_number(_external_number(call)),
                 duration_seconds=call.duration_seconds,
                 direction=call.direction.value,
-                keywords_found=list(dict.fromkeys(keyword.canonical_phrase for _, keyword, _ in matches)),
-                match_count=len(matches),
-                processing_status=item_statuses.get(
-                    (call.id, operator.id), call.processing_status
+                keywords_found=list(
+                    dict.fromkeys(keyword.canonical_phrase for _, keyword, _ in matches)
                 ),
+                match_count=len(matches),
+                processing_status=item_statuses.get((call.id, operator.id), call.processing_status),
             )
         )
     return Page(items=items, total=total, page=page, page_size=page_size)
@@ -571,7 +738,10 @@ async def export_results(
 ) -> StreamingResponse:
     if direction and direction.lower() not in {item.value for item in Direction}:
         raise HTTPException(status_code=422, detail="Invalid direction filter.")
-    if sort not in {"occurred_at", "operator", "duration_seconds", "match_count"} or order not in {"asc", "desc"}:
+    if sort not in {"occurred_at", "operator", "duration_seconds", "match_count"} or order not in {
+        "asc",
+        "desc",
+    }:
         raise HTTPException(status_code=422, detail="Invalid export sorting.")
     _validate_match_filter_combination(
         has_matches=has_matches,
@@ -590,6 +760,7 @@ async def export_results(
     else:
         base = _result_query(
             job_id=job.id,
+            include_all_speakers=job.include_all_speakers,
             date_from=from_utc,
             date_to=to_utc,
             operator_id=operator_id,
@@ -601,6 +772,8 @@ async def export_results(
             has_matches=has_matches,
         )
         match_count_sort = _match_count_expression(
+            job_id=job.id,
+            include_all_speakers=job.include_all_speakers,
             keyword_id=keyword_id,
             keyword=keyword,
             category_id=category_id,
@@ -612,17 +785,23 @@ async def export_results(
             "match_count": match_count_sort,
         }[sort]
         sort_expression = sort_expression.asc() if order == "asc" else sort_expression.desc()
-        pairs = (
-            await db.execute(base.order_by(sort_expression, Call.id).limit(100_001))
-        ).all()
+        pairs = (await db.execute(base.order_by(sort_expression, Call.id).limit(100_001))).all()
     if len(pairs) > 100_000:
-        raise HTTPException(status_code=422, detail="Export is too large. Choose a narrower date range.")
-    grouped = await _matches_for_pairs(
-        db,
-        pairs,
-        keyword_id=keyword_id,
-        keyword_text=keyword,
-        category_id=category_id,
+        raise HTTPException(
+            status_code=422, detail="Export is too large. Choose a narrower date range."
+        )
+    grouped = (
+        await _matches_for_pairs(
+            db,
+            pairs,
+            job_id=job.id,
+            include_all_speakers=job.include_all_speakers,
+            keyword_id=keyword_id,
+            keyword_text=keyword,
+            category_id=category_id,
+        )
+        if job is not None
+        else {}
     )
 
     def rows() -> Iterator[list[Any]]:
@@ -661,7 +840,13 @@ async def export_results(
                 ]
             for match, keyword, category in matches:
                 excerpt = " ".join(
-                    part for part in (match.context_before, match.original_matched_text, match.context_after) if part
+                    part
+                    for part in (
+                        match.context_before,
+                        match.original_matched_text,
+                        match.context_after,
+                    )
+                    if part
                 )
                 yield [
                     local_started.date().isoformat(),
@@ -710,12 +895,340 @@ def _match_response(match: KeywordMatch) -> MatchResponse:
     )
 
 
+_MANUAL_ASSIGNMENT_ALLOWED_STATUSES = {
+    SpeakerAttributionStatus.CHANNEL_UNKNOWN,
+    SpeakerAttributionStatus.CALLER_CALLEE_ONLY,
+    SpeakerAttributionStatus.MANUALLY_ASSIGNED,
+}
+
+_NON_SPEAKER_LABELS = {
+    "agent",
+    "channel 0",
+    "channel 1",
+    "channel a",
+    "channel b",
+    "operator",
+    "speaker 0",
+    "speaker 1",
+    "unknown",
+    "unknown speaker",
+}
+
+
+def _available_channels(segments: list[TranscriptSegment]) -> list[int]:
+    return sorted({segment.channel_index for segment in segments if segment.channel_index is not None})
+
+
+def _speaker_assignment_required(
+    transcript: Transcript,
+    segments: list[TranscriptSegment],
+) -> bool:
+    if transcript.transcription_mode != TranscriptionMode.DUAL_CHANNEL:
+        return False
+    if transcript.speaker_attribution_status in {
+        SpeakerAttributionStatus.MANUALLY_ASSIGNED,
+        SpeakerAttributionStatus.CONFIRMED_BY_PBX,
+        SpeakerAttributionStatus.ANONYMOUS_DIARIZATION,
+    }:
+        return False
+    return any(
+        segment.operator_id is None and segment.channel_index is not None for segment in segments
+    )
+
+
+def _opposite_channel_label(
+    call: Call,
+    opposite_channel: int,
+    opposite_segments: list[TranscriptSegment],
+) -> str:
+    """Choose a non-operator label without inventing attribution confidence."""
+
+    preserved = {
+        segment.speaker_label
+        for segment in opposite_segments
+        if segment.channel_index == opposite_channel
+        and segment.speaker_label
+        and segment.speaker_label.strip().casefold() not in _NON_SPEAKER_LABELS
+    }
+    if preserved:
+        return sorted(preserved)[0]
+    if call.direction == Direction.OUTBOUND:
+        return "Customer"
+    if call.direction == Direction.INBOUND:
+        return "Customer"
+    return "Customer"
+
+
+def _transcript_confidence_status(transcript: Transcript) -> str:
+    summary = transcript.quality_summary
+    if isinstance(summary, dict):
+        value = summary.get("confidence_status")
+        if isinstance(value, str) and value:
+            return value
+    return "unavailable"
+
+
+def _segment_quality_flags(segments: list[TranscriptSegment]) -> list[str]:
+    flags: list[str] = []
+    seen: set[str] = set()
+    for segment in segments:
+        for flag in segment.quality_flags or []:
+            if flag and flag not in seen:
+                seen.add(flag)
+                flags.append(flag)
+    return flags
+
+
+async def _keyword_definitions_for_manual(
+    db: AsyncSession,
+) -> tuple[list[KeywordDefinition], dict[str, Keyword]]:
+    keywords = (
+        await db.scalars(
+            select(Keyword)
+            .options(selectinload(Keyword.variants))
+            .where(Keyword.active.is_(True), Keyword.deleted_at.is_(None))
+        )
+    ).all()
+    definitions = [
+        KeywordDefinition(
+            id=str(keyword.id),
+            phrase=keyword.canonical_phrase,
+            variants=tuple(item.phrase for item in keyword.variants),
+            accent_insensitive=keyword.accent_insensitive,
+            whole_word=keyword.whole_word,
+            exact_phrase=keyword.exact_phrase,
+            fuzzy_match=keyword.fuzzy_match,
+            fuzzy_threshold=keyword.fuzzy_threshold,
+        )
+        for keyword in keywords
+    ]
+    return definitions, {str(item.id): item for item in keywords}
+
+
+async def _rebuild_operator_matches(
+    db: AsyncSession,
+    transcript: Transcript,
+    operator_id: UUID,
+) -> int:
+    """Re-run keyword matching under normal operator-only rules."""
+
+    definitions, keyword_by_id = await _keyword_definitions_for_manual(db)
+    if not definitions:
+        return 0
+    segments = (
+        await db.scalars(
+            select(TranscriptSegment).where(TranscriptSegment.transcript_id == transcript.id)
+        )
+    ).all()
+    added = 0
+    for segment in segments:
+        if segment.operator_id != operator_id:
+            continue
+        for found in match_text(segment.original_text, definitions):
+            keyword = keyword_by_id[found.keyword_id]
+            db.add(
+                KeywordMatch(
+                    keyword_id=keyword.id,
+                    operator_id=operator_id,
+                    call_id=transcript.call_id,
+                    transcript_segment_id=segment.id,
+                    original_matched_text=found.original_matched_text,
+                    normalized_match=found.normalized_match,
+                    context_before=found.context_before,
+                    context_after=found.context_after,
+                    start_seconds=segment.start_seconds,
+                    end_seconds=segment.end_seconds,
+                    match_method=found.method,
+                    match_score=Decimal(str(round(found.score, 3))),
+                )
+            )
+            added += 1
+    await db.flush()
+    return added
+
+
+@router.patch(
+    "/calls/{call_id}/speaker-assignment",
+    response_model=SpeakerAssignmentResponse,
+)
+async def assign_operator_channel(
+    call_id: UUID,
+    payload: SpeakerAssignmentRequest,
+    request: Request,
+    user: CurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> SpeakerAssignmentResponse:
+    """Correct dual-channel speaker attribution without retranscribing audio."""
+
+    call = await db.scalar(select(Call).where(Call.id == call_id).with_for_update())
+    if call is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Call not found.")
+
+    transcript = await db.scalar(
+        select(Transcript).where(Transcript.id == payload.transcript_id).with_for_update()
+    )
+    if transcript is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Transcript not found."
+        )
+    if transcript.call_id != call.id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The transcript does not belong to this call.",
+        )
+    if not transcript.is_current:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Only the current transcript can be manually assigned.",
+        )
+    if transcript.status != TranscriptStatus.COMPLETED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The transcript must be completed before speaker assignment.",
+        )
+    if transcript.transcription_mode != TranscriptionMode.DUAL_CHANNEL:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Manual assignment is only available for separated dual-channel transcripts.",
+        )
+    if (
+        transcript.speaker_attribution_status is not None
+        and transcript.speaker_attribution_status not in _MANUAL_ASSIGNMENT_ALLOWED_STATUSES
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This transcript's speaker attribution cannot be manually assigned.",
+        )
+
+    operator = await db.get(Operator, payload.operator_id)
+    if operator is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Operator not found."
+        )
+    relevant_participant_id = await db.scalar(
+        select(CallParticipant.id)
+        .where(
+            CallParticipant.call_id == call.id,
+            CallParticipant.operator_id == operator.id,
+        )
+        .limit(1)
+    )
+    if relevant_participant_id is None:
+        relevant_participant_id = await db.scalar(
+            select(ProcessingJobItem.id)
+            .where(
+                ProcessingJobItem.call_id == call.id,
+                ProcessingJobItem.operator_id == operator.id,
+            )
+            .limit(1)
+        )
+    if relevant_participant_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The selected operator was not part of this call.",
+        )
+
+    segments = list(
+        (
+            await db.scalars(
+                select(TranscriptSegment)
+                .where(TranscriptSegment.transcript_id == transcript.id)
+                .order_by(TranscriptSegment.sequence_number, TranscriptSegment.id)
+                .with_for_update()
+            )
+        ).all()
+    )
+    available_channels = _available_channels(segments)
+    if payload.operator_channel_index not in available_channels:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="The requested channel is not present in this transcript.",
+        )
+
+    requested_channel = payload.operator_channel_index
+    opposite_channel = 1 - requested_channel
+    opposite_segments = [
+        segment for segment in segments if segment.channel_index == opposite_channel
+    ]
+    opposite_label = _opposite_channel_label(call, opposite_channel, opposite_segments)
+    previous_status = (
+        transcript.speaker_attribution_status.value
+        if transcript.speaker_attribution_status is not None
+        else None
+    )
+
+    for segment in segments:
+        if segment.channel_index == requested_channel:
+            segment.operator_id = operator.id
+            segment.speaker_label = operator.display_name
+            segment.speaker_source = SpeakerSource.MANUAL_OVERRIDE
+        elif segment.channel_index == opposite_channel:
+            segment.operator_id = None
+            segment.speaker_label = opposite_label
+            segment.speaker_source = SpeakerSource.UNKNOWN
+            flag_modified(segment, "operator_id")
+
+    transcript.operator_id = operator.id
+    transcript.speaker_attribution_status = SpeakerAttributionStatus.MANUALLY_ASSIGNED
+
+    segment_ids = [segment.id for segment in segments]
+    if segment_ids:
+        await db.execute(
+            delete(KeywordMatch).where(KeywordMatch.transcript_segment_id.in_(segment_ids))
+        )
+    await db.flush()
+    await _rebuild_operator_matches(db, transcript, operator.id)
+
+    call.processing_status = "completed"
+    call.last_error_category = None
+    call.last_error_message = None
+
+    await audit(
+        db,
+        action="call.speaker_assignment",
+        request=request,
+        user=user,
+        resource_type="transcript",
+        resource_id=str(transcript.id),
+        details={
+            "call_id": str(call.id),
+            "transcript_id": str(transcript.id),
+            "operator_id": str(operator.id),
+            "operator_channel_index": requested_channel,
+            "previous_attribution_status": previous_status,
+        },
+    )
+    await db.commit()
+
+    return SpeakerAssignmentResponse(
+        transcript_id=transcript.id,
+        transcription_mode=(
+            transcript.transcription_mode.value
+            if transcript.transcription_mode is not None
+            else None
+        ),
+        speaker_attribution_status=(
+            transcript.speaker_attribution_status.value
+            if transcript.speaker_attribution_status is not None
+            else None
+        ),
+        speaker_assignment_required=_speaker_assignment_required(transcript, segments),
+        available_channels=available_channels,
+        operator_id=operator.id,
+        operator_channel_index=requested_channel,
+        confidence_status=_transcript_confidence_status(transcript),
+        quality_flags=_segment_quality_flags(segments),
+        pipeline_version=transcript.pipeline_version,
+    )
+
+
 @router.get("/calls/{call_id}", response_model=CallDetailResponse)
 async def call_detail(
     call_id: UUID,
     user: CurrentUser,
     db: Annotated[AsyncSession, Depends(get_db)],
     settings: EffectiveYeastarSettings,
+    job_id: UUID | None = None,
 ) -> CallDetailResponse:
     call = await db.get(Call, call_id)
     if call is None:
@@ -728,15 +1241,41 @@ async def call_detail(
             .order_by(CallParticipant.created_at)
         )
     ).all()
+    transcript_conditions = [
+        Transcript.call_id == call.id,
+        Transcript.status == TranscriptStatus.COMPLETED,
+    ]
+    if job_id is None:
+        transcript_conditions.append(Transcript.is_current.is_(True))
+    else:
+        await _resolve_result_job(db, job_id)
+        bound_transcript_ids = select(ProcessingJobItem.result_transcript_id).where(
+            ProcessingJobItem.job_id == job_id,
+            ProcessingJobItem.call_id == call.id,
+            ProcessingJobItem.result_transcript_id.is_not(None),
+        )
+        transcript_conditions.append(Transcript.id.in_(bound_transcript_ids))
+    selected_transcripts = (
+        await db.scalars(
+            select(Transcript)
+            .where(*transcript_conditions)
+            .order_by(Transcript.created_at, Transcript.id)
+        )
+    ).all()
+    segment_conditions = [
+        TranscriptSegment.call_id == call.id,
+        *transcript_conditions,
+    ]
     segments = (
         await db.scalars(
             select(TranscriptSegment)
+            .join(Transcript, Transcript.id == TranscriptSegment.transcript_id)
             .options(
                 selectinload(TranscriptSegment.matches)
                 .selectinload(KeywordMatch.keyword)
                 .selectinload(Keyword.category)
             )
-            .where(TranscriptSegment.call_id == call.id)
+            .where(*segment_conditions)
             .order_by(TranscriptSegment.start_seconds, TranscriptSegment.sequence_number)
         )
     ).all()
@@ -755,6 +1294,13 @@ async def call_detail(
                 end_timestamp=segment.end_seconds,
                 original_text=segment.original_text,
                 confidence=segment.confidence,
+                transcription_model=segment.transcription_model,
+                mean_logprob=segment.mean_logprob,
+                low_logprob_ratio=segment.low_logprob_ratio,
+                quality_flags=list(segment.quality_flags or []),
+                audio_variant=segment.audio_variant,
+                channel_index=segment.channel_index,
+                sequence_number=segment.sequence_number,
                 matches=matches,
             )
         )
@@ -769,13 +1315,16 @@ async def call_detail(
     local_audio_available = False
     if len(recordings) == 1 and recordings[0].storage_key:
         try:
-            local_audio_available = AudioProcessor(settings).safe_storage_path(
-                recordings[0].storage_key
-            ).is_file()
+            local_audio_available = (
+                AudioProcessor(settings).safe_storage_path(recordings[0].storage_key).is_file()
+            )
         except Exception:
             local_audio_available = False
+    primary_transcript = selected_transcripts[0] if selected_transcripts else None
+    available_channels = _available_channels(segments)
     return CallDetailResponse(
         id=call.id,
+        transcript_id=primary_transcript.id if primary_transcript is not None else None,
         started_at=call.started_at,
         caller=call.caller_number,
         caller_name=call.caller_name,
@@ -787,8 +1336,7 @@ async def call_detail(
         queue=call.queue_name,
         processing_status=call.processing_status,
         audio_available=(
-            len(recordings) == 1
-            and (local_audio_available or settings.yeastar_configured)
+            len(recordings) == 1 and (local_audio_available or settings.yeastar_configured)
         ),
         participants=[
             {
@@ -802,6 +1350,46 @@ async def call_detail(
         ],
         matches=sorted(top_matches, key=lambda item: item.start_timestamp),
         transcript_segments=responses,
+        transcription_mode=(
+            primary_transcript.transcription_mode.value
+            if primary_transcript is not None and primary_transcript.transcription_mode is not None
+            else None
+        ),
+        speaker_attribution_status=(
+            primary_transcript.speaker_attribution_status.value
+            if primary_transcript is not None
+            and primary_transcript.speaker_attribution_status is not None
+            else None
+        ),
+        speaker_assignment_required=(
+            _speaker_assignment_required(primary_transcript, segments)
+            if primary_transcript is not None
+            else False
+        ),
+        available_channels=available_channels,
+        confidence_status=(
+            _transcript_confidence_status(primary_transcript)
+            if primary_transcript is not None
+            else "unavailable"
+        ),
+        quality_flags=_segment_quality_flags(segments),
+        pipeline_version=primary_transcript.pipeline_version if primary_transcript is not None else None,
+        transcript_quality_summaries=[
+            TranscriptQualitySummaryResponse(
+                transcript_id=transcript.id,
+                transcription_mode=(
+                    transcript.transcription_mode.value
+                    if transcript.transcription_mode is not None
+                    else None
+                ),
+                quality_summary=(
+                    dict(transcript.quality_summary)
+                    if transcript.quality_summary is not None
+                    else None
+                ),
+            )
+            for transcript in selected_transcripts
+        ],
         processing_history=[
             {
                 "status": item.status.value,
@@ -809,7 +1397,9 @@ async def call_detail(
                 "attempt": item.attempt_count,
                 "updated_at": item.updated_at.isoformat(),
                 "error": item.error_message,
-                "message": item.stage if not item.error_message else f"{item.stage}: {item.error_message}",
+                "message": item.stage
+                if not item.error_message
+                else f"{item.stage}: {item.error_message}",
                 "created_at": item.created_at.isoformat(),
                 "occurred_at": item.updated_at.isoformat(),
             }
@@ -818,7 +1408,272 @@ async def call_detail(
     )
 
 
-@router.post("/calls/{call_id}/retry", response_model=MessageResponse, status_code=status.HTTP_202_ACCEPTED)
+async def _lock_current_reprocess_transcript(
+    db: AsyncSession,
+    *,
+    call_id: UUID,
+    transcript_id: UUID | None,
+) -> Transcript:
+    """Lock a current transcript in the shared Recording-before-Transcript order."""
+
+    statement = (
+        select(Transcript)
+        .where(
+            Transcript.call_id == call_id,
+            Transcript.status == TranscriptStatus.COMPLETED,
+            Transcript.is_current.is_(True),
+        )
+        .order_by(
+            Transcript.completed_at.desc().nulls_last(),
+            Transcript.updated_at.desc().nulls_last(),
+            Transcript.created_at.desc().nulls_last(),
+            Transcript.id.desc(),
+        )
+    )
+    if transcript_id is not None:
+        statement = statement.where(Transcript.id == transcript_id)
+
+    candidates = (await db.scalars(statement)).all()
+    if not candidates:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This call has no completed current transcript to reprocess.",
+        )
+    if len(candidates) > 1:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Choose the transcript to reprocess for this call.",
+        )
+
+    locked_recording_id = await db.scalar(
+        select(Recording.id).where(Recording.id == candidates[0].recording_id).with_for_update()
+    )
+    if locked_recording_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The recording selected for reprocessing is unavailable.",
+        )
+
+    # Retention may have won the recording lock and removed the candidate while
+    # this request waited. Re-read and lock the authoritative current row only
+    # after the Recording lock has been acquired.
+    current = (await db.scalars(statement.with_for_update())).all()
+    if not current:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This call has no completed current transcript to reprocess.",
+        )
+    if len(current) > 1:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Choose the transcript to reprocess for this call.",
+        )
+    if current[0].recording_id != locked_recording_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The transcript selected for reprocessing changed. Try again.",
+        )
+    return current[0]
+
+
+@router.post(
+    "/calls/{call_id}/reprocess",
+    response_model=JobDetail,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def reprocess_call(
+    call_id: UUID,
+    payload: CallReprocessRequest,
+    request: Request,
+    user: CurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    settings: EffectiveRuntimeSettings,
+) -> JobDetail:
+    """Queue an explicit replacement while keeping the current transcript readable."""
+    _require_integrations(settings)
+    if payload.pipeline_version == "pipeline-v2" and not (
+        settings.TRANSCRIPTION_PIPELINE_V2_ENABLED
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Pipeline V2 is disabled.",
+        )
+    # An active worker owns ProcessingJob, so reject it before taking target
+    # locks. Retention and discovery lock Recording before job/transcript rows;
+    # take the same Recording-first path before locking Call so a failed-job
+    # retry (job then call) cannot complete a recording/job/call lock cycle.
+    if await active_job(db, lock=True) is not None:
+        raise active_job_conflict()
+    call = await db.get(Call, call_id)
+    if call is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Call not found.")
+
+    current_transcript = await _lock_current_reprocess_transcript(
+        db,
+        call_id=call.id,
+        transcript_id=payload.transcript_id,
+    )
+    call = await db.scalar(select(Call).where(Call.id == call_id).with_for_update())
+    if call is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Call not found.")
+
+    source_item_statement = (
+        select(ProcessingJobItem)
+        .where(
+            ProcessingJobItem.call_id == call.id,
+            ProcessingJobItem.recording_id == current_transcript.recording_id,
+            ProcessingJobItem.result_transcript_id == current_transcript.id,
+            ProcessingJobItem.status == ItemStatus.COMPLETED,
+        )
+        .order_by(
+            ProcessingJobItem.updated_at.desc(),
+            ProcessingJobItem.created_at.desc(),
+            ProcessingJobItem.id.desc(),
+        )
+    )
+    if current_transcript.operator_id is not None:
+        source_item_statement = source_item_statement.where(
+            ProcessingJobItem.operator_id == current_transcript.operator_id
+        )
+    source_items = (await db.scalars(source_item_statement)).all()
+    source_item = source_items[0] if source_items else None
+    source_operator_ids = {item.operator_id for item in source_items}
+    if current_transcript.operator_id is not None:
+        if payload.operator_id not in {None, current_transcript.operator_id}:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="The selected operator does not own this transcript.",
+            )
+        operator_id = current_transcript.operator_id
+    elif payload.operator_id is not None:
+        if payload.operator_id not in source_operator_ids:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="The selected operator was not part of this transcript's analysis.",
+            )
+        operator_id = payload.operator_id
+        source_item = next(item for item in source_items if item.operator_id == payload.operator_id)
+    elif len(source_operator_ids) == 1:
+        operator_id = next(iter(source_operator_ids))
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Choose the operator whose unattributed transcript should be reprocessed.",
+        )
+    source_job = await db.get(ProcessingJob, source_item.job_id) if source_item else None
+
+    job_id = uuid4()
+    item_id = uuid4()
+    idempotency_key = hashlib.sha256(f"call-reprocess:{job_id}".encode("utf-8")).hexdigest()
+    date_from = call.started_at
+    minimum_date_to = date_from + timedelta(seconds=1)
+    date_to = call.ended_at if call.ended_at and call.ended_at > date_from else minimum_date_to
+    job = ProcessingJob(
+        id=job_id,
+        idempotency_key=idempotency_key,
+        requested_by_id=user.id,
+        status=JobStatus.QUEUED,
+        date_from=date_from,
+        date_to=max(date_to, minimum_date_to),
+        direction=call.direction.value,
+        recording_available=True,
+        include_all_speakers=(
+            source_job.include_all_speakers
+            if source_job is not None
+            else current_transcript.operator_id is None
+        ),
+        selected_operator_ids=[str(operator_id)],
+        selected_category_ids=(
+            list(source_job.selected_category_ids) if source_job is not None else []
+        ),
+        request_filters={
+            "_reprocess": True,
+            "_reprocess_targets": {str(item_id): str(current_transcript.id)},
+        },
+        current_stage="Queued for reprocessing",
+        calls_found=1,
+        recordings_found=1,
+    )
+    db.add(job)
+    item = ProcessingJobItem(
+        id=item_id,
+        job_id=job.id,
+        call_id=call.id,
+        operator_id=operator_id,
+        recording_id=current_transcript.recording_id,
+        idempotency_key=hashlib.sha256(
+            f"reprocess-item:{job.id}:{current_transcript.id}".encode("utf-8")
+        ).hexdigest(),
+        requested_pipeline_version=payload.pipeline_version,
+        status=ItemStatus.QUEUED,
+        stage="queued_for_reprocessing",
+    )
+    db.add(item)
+    try:
+        await audit(
+            db,
+            action="call.reprocess",
+            request=request,
+            user=user,
+            resource_type="call",
+            resource_id=str(call.id),
+            details={
+                "job_id": str(job.id),
+                "item_id": str(item.id),
+                "source_transcript_id": str(current_transcript.id),
+                "operator_id": str(operator_id),
+                "pipeline_version": payload.pipeline_version,
+            },
+        )
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        if await active_job(db) is not None:
+            raise active_job_conflict() from None
+        raise
+
+    await db.refresh(job, attribute_names=["items"])
+    try:
+        task = process_job_item.delay(str(item.id))
+    except Exception as exc:
+        completed_at = utc_now()
+        job.status = JobStatus.FAILED
+        job.current_stage = "Reprocessing could not be queued"
+        job.last_error_category = "processing_service"
+        job.last_error_message = "Processing service is unavailable."
+        job.completed_at = completed_at
+        item.status = ItemStatus.FAILED
+        item.stage = "failed"
+        item.error_category = "processing_service"
+        item.error_message = "Processing service is unavailable."
+        item.completed_at = completed_at
+        try:
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            logger.exception("Could not persist failed reprocess dispatch state")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Processing service is unavailable.",
+        ) from exc
+    item.celery_task_id = task.id
+    queued_response = job_detail(job, is_current=True)
+    try:
+        await db.commit()
+    except Exception:
+        # The task has already been acknowledged by Celery and the durable job
+        # was committed before dispatch.  Roll back only the optional task-id
+        # update; reporting a failure here could cause a duplicate user retry.
+        await db.rollback()
+        logger.exception("Reprocess task was queued but its task id was not persisted")
+        return queued_response
+    await db.refresh(job, attribute_names=["items"])
+    return job_detail(job, is_current=True)
+
+
+@router.post(
+    "/calls/{call_id}/retry", response_model=MessageResponse, status_code=status.HTTP_202_ACCEPTED
+)
 async def retry_call(
     call_id: UUID,
     request: Request,
@@ -893,8 +1748,7 @@ async def retry_call(
         for states in statuses_by_call.values()
     )
     job.calls_failed = sum(
-        any(state == ItemStatus.FAILED for state in states)
-        for states in statuses_by_call.values()
+        any(state == ItemStatus.FAILED for state in states) for states in statuses_by_call.values()
     ) + int((job.request_filters or {}).get("_discovery_failures", 0))
     job.progress_percent = round(final_items * 100 / len(job.items)) if job.items else 0
     call.processing_status = "queued"
@@ -1006,7 +1860,9 @@ async def stream_audio(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Call not found.")
     recordings = (await db.scalars(select(Recording).where(Recording.call_id == call.id))).all()
     if not recordings:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Recording is unavailable.")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Recording is unavailable."
+        )
     if len(recordings) != 1:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -1018,7 +1874,9 @@ async def stream_audio(
     path = audio.safe_storage_path(recording.storage_key) if recording.storage_key else None
     if path is None or not path.exists():
         if not settings.yeastar_configured:
-            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Recording is unavailable.")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Recording is unavailable."
+            )
         suffix = Path(recording.yeastar_file_name or "").suffix.lower()
         path = audio.safe_storage_path(f"tmp/stream-{uuid4()}{suffix}")
         async with YeastarClient(settings=settings) as client:

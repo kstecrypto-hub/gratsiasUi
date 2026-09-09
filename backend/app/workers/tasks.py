@@ -37,7 +37,13 @@ def _busy_retry_delay(retries: int) -> int:
 
 @celery_app.task(name="app.workers.tasks.process_analysis_job", bind=True, max_retries=None)
 def process_analysis_job(self, job_id: str) -> dict[str, int]:
-    result: DiscoveryResult = _run(discover_job_items(UUID(job_id)))
+    try:
+        result: DiscoveryResult = _run(discover_job_items(UUID(job_id)))
+    except ProcessingBusyError as exc:
+        raise self.retry(
+            exc=exc,
+            countdown=_busy_retry_delay(self.request.retries),
+        )
     for item_id in result.item_ids:
         process_job_item.delay(str(item_id))
     if result.recording_assignment_pending:

@@ -18,12 +18,17 @@ export default function CallDetailPage() {
   const [actionError, setActionError] = useState("");
   const [audioError, setAudioError] = useState("");
   const [retrying, setRetrying] = useState(false);
+  const [assigning, setAssigning] = useState(false);
+  const [assignmentError, setAssignmentError] = useState("");
+  const [assignmentOperatorId, setAssignmentOperatorId] = useState("");
+  const [assignmentDismissed, setAssignmentDismissed] = useState(false);
   const [resultsHref, setResultsHref] = useState("/results");
 
   const load = useCallback(async () => {
     setError("");
     try {
-      setCall(await api.calls.get(id));
+      const jobId = new URLSearchParams(window.location.search).get("job_id") || undefined;
+      setCall(await api.calls.get(id, jobId));
     } catch (caught) {
       setError(messageFromError(caught));
     }
@@ -34,6 +39,22 @@ export default function CallDetailPage() {
 
   const matches = useMemo(() => call?.matches || [], [call]);
   const segments = useMemo(() => call?.transcript_segments || [], [call]);
+  const assignmentOperators = useMemo(() => {
+    const rows = (call?.participants || [])
+      .filter((participant) => participant.operator_id)
+      .map((participant) => ({
+        id: String(participant.operator_id),
+        name: participant.operator_name || `Extension ${participant.extension || ""}`.trim(),
+      }));
+    return Array.from(new Map(rows.map((row) => [row.id, row])).values());
+  }, [call]);
+  useEffect(() => {
+    if (assignmentOperators.length === 1 && assignmentOperatorId !== assignmentOperators[0].id) {
+      setAssignmentOperatorId(assignmentOperators[0].id);
+    }
+    if (assignmentOperators.length === 0) setAssignmentOperatorId("");
+  }, [assignmentOperators, assignmentOperatorId]);
+  useEffect(() => { setAssignmentDismissed(false); }, [call?.id]);
 
   function seek(seconds: number) {
     if (!audioRef.current) return;
@@ -51,6 +72,39 @@ export default function CallDetailPage() {
       setActionError(messageFromError(caught, "This call could not be retried."));
     } finally {
       setRetrying(false);
+    }
+  }
+
+  const assignmentAvailable = call?.transcription_mode === "dual_channel" && (
+    call?.speaker_assignment_required === true || call?.speaker_attribution_status === "manually_assigned"
+  );
+  const needsReview = (call?.confidence_status && call.confidence_status !== "unavailable") ||
+    Boolean(call?.transcript_segments?.some((segment) => segment.quality_flags?.length));
+
+  async function assignChannel(channel: 0 | 1) {
+    if (!call?.transcript_id || !assignmentOperatorId) {
+      setAssignmentError("Choose the operator whose speech should be assigned.");
+      return;
+    }
+    if (call.speaker_attribution_status === "manually_assigned") {
+      const confirmed = window.confirm(
+        "A manual operator-channel assignment already exists. Replace it with the channel you selected?",
+      );
+      if (!confirmed) return;
+    }
+    setAssigning(true);
+    setAssignmentError("");
+    try {
+      await api.calls.assignSpeaker(id, {
+        transcript_id: call.transcript_id,
+        operator_id: assignmentOperatorId,
+        operator_channel_index: channel,
+      });
+      await load();
+    } catch (caught) {
+      setAssignmentError(messageFromError(caught, "The operator channel could not be assigned."));
+    } finally {
+      setAssigning(false);
     }
   }
 
@@ -85,6 +139,70 @@ export default function CallDetailPage() {
         </dl>
       </section>
 
+      {assignmentAvailable && !assignmentDismissed ? (
+        <section className="section" aria-labelledby="speaker-assignment-title">
+          <div className="section-header">
+            <div>
+              <h2 id="speaker-assignment-title">Operator channel</h2>
+              {call.speaker_assignment_required ? (
+                <p className="notice" role="status">
+                  The operator channel could not be identified automatically.
+                </p>
+              ) : (
+                <p>A manual operator-channel assignment is already in place.</p>
+              )}
+            </div>
+          </div>
+          {assignmentOperators.length > 1 ? (
+            <label className="field">
+              Operator
+              <select
+                value={assignmentOperatorId}
+                onChange={(event) => setAssignmentOperatorId(event.target.value)}
+              >
+                <option value="">Choose operator</option>
+                {assignmentOperators.map((operator) => (
+                  <option key={operator.id} value={operator.id}>{operator.name}</option>
+                ))}
+              </select>
+            </label>
+          ) : null}
+          <div className="page-actions">
+            {call.available_channels?.includes(0) ? (
+              <button
+                type="button"
+                className="button"
+                disabled={assigning || !assignmentOperatorId}
+                onClick={() => void assignChannel(0)}
+              >
+                {assigning ? "Assigning…" : "Operator is Channel A"}
+              </button>
+            ) : null}
+            {call.available_channels?.includes(1) ? (
+              <button
+                type="button"
+                className="button"
+                disabled={assigning || !assignmentOperatorId}
+                onClick={() => void assignChannel(1)}
+              >
+                {assigning ? "Assigning…" : "Operator is Channel B"}
+              </button>
+            ) : null}
+            {call.speaker_assignment_required ? (
+              <button
+                type="button"
+                className="button secondary"
+                disabled={assigning}
+                onClick={() => setAssignmentDismissed(true)}
+              >
+                Leave unassigned
+              </button>
+            ) : null}
+          </div>
+          {assignmentError ? <div className="form-error" role="alert">{assignmentError}</div> : null}
+        </section>
+      ) : null}
+
       <section className="section" aria-labelledby="recording-title">
         <div className="section-header"><div><h2 id="recording-title">Recording</h2><p>Use a detected phrase timestamp to jump to that moment.</p></div></div>
         {hasAudio ? <><audio ref={audioRef} className="audio-player" controls preload="metadata" src={api.calls.audioUrl(id)} onError={() => setAudioError("The recording could not be played. Your session may have expired or the audio may have been removed according to the retention settings.")}>Your browser does not support audio playback.</audio>{audioError ? <div className="form-error" role="alert">{audioError}</div> : null}</> : <div className="notice" role="status">No recording is available for this call.</div>}
@@ -101,7 +219,7 @@ export default function CallDetailPage() {
       </section>
 
       <section className="section" aria-labelledby="transcript-title">
-        <div className="section-header"><div><h2 id="transcript-title">Transcript</h2><p>Speaker labels reflect the available call and audio evidence. Unknown speakers remain marked as unknown.</p></div></div>
+        <div className="section-header"><div><h2 id="transcript-title">Transcript</h2><p>Speaker labels reflect the available call and audio evidence. Unknown speakers remain marked as unknown.</p>{needsReview ? <span className="notice" role="status">Needs review</span> : null}</div></div>
         {segments.length ? <div className="transcript">{segments.map((segment) => <TranscriptRow key={String(segment.id)} segment={segment} matches={matches} onSeek={seek} />)}</div> : <div className="empty-state"><h2>No transcript is available</h2><p className="muted">The recording may not have been transcribed, or processing may still be underway.</p></div>}
       </section>
 

@@ -151,3 +151,22 @@ def safe_operator_channel(
     if participant.was_callee and not participant.was_caller:
         return 1
     return None
+
+
+def safe_caller_callee_channels(
+    channel_count: int,
+    stereo_separated: bool,
+    *,
+    one_to_one: bool = False,
+    was_transferred: bool = False,
+) -> tuple[int, int] | None:
+    """Return Yeastar's caller/callee mapping only for a proven one-to-one recording."""
+
+    if (
+        channel_count != 2
+        or not stereo_separated
+        or not one_to_one
+        or was_transferred
+    ):
+        return None
+    return (0, 1)

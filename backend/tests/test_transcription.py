@@ -28,6 +28,7 @@ def _fake_openai(*responses: object) -> tuple[SimpleNamespace, AsyncMock]:
         audio=SimpleNamespace(transcriptions=SimpleNamespace(create=create)),
         models=SimpleNamespace(retrieve=AsyncMock()),
     )
+    client.with_options = lambda **_: client
     return client, create
 
 
@@ -140,6 +141,43 @@ async def test_diarization_clamps_timestamps_and_ignores_non_finite_values(tmp_p
     assert [(segment.start_seconds, segment.end_seconds) for segment in result.segments] == [
         (100.0, 110.0)
     ]
+
+
+@pytest.mark.asyncio
+async def test_complete_diarization_uses_one_anonymous_supported_request(
+    tmp_path: Path,
+) -> None:
+    response = {
+        "duration": 30.0,
+        "segments": [
+            {"start": 1.0, "end": 4.0, "text": "rough text", "speaker": "A"},
+        ],
+        "usage": {"input_tokens": 11, "output_tokens": 3},
+    }
+    fake, create = _fake_openai(response)
+    client = OpenAITranscriptionClient(_settings(tmp_path), client=fake)
+    chunk = _chunk(tmp_path, 1, 0.0, 30.0)
+
+    result = await client.transcribe_diarized_complete(chunk)
+
+    assert create.await_count == 1
+    assert result.segments[0].speaker_label == "A"
+    assert result.segments[0].start_seconds == 1.0
+    assert result.segments[0].end_seconds == 4.0
+    assert result.usage["totals"] == {"input_tokens": 11, "output_tokens": 3}
+    request = create.await_args.kwargs
+    assert request["model"] == "gpt-4o-transcribe-diarize"
+    assert request["language"] == "el"
+    assert request["response_format"] == "diarized_json"
+    assert request["chunking_strategy"] == "auto"
+    for forbidden in (
+        "prompt",
+        "include",
+        "known_speaker_names",
+        "known_speaker_references",
+        "timestamp_granularities",
+    ):
+        assert forbidden not in request
 
 
 @pytest.mark.asyncio

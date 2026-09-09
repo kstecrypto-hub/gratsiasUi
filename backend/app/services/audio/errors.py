@@ -8,3 +8,7 @@ class InvalidAudioError(AudioError):
 
 class AudioToolError(AudioError):
     category = "audio_tool"
+
+
+class AudioSegmentationCancelledError(AudioError):
+    category = "cancelled"

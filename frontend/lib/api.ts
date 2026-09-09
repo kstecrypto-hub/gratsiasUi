@@ -19,6 +19,8 @@ import type {
   ResultFilters,
   ResultRow,
   Settings,
+  SpeakerAssignmentInput,
+  SpeakerAssignmentResult,
   TranscriptSegment,
   YeastarConfigurationValidation,
   YeastarConnectionConfiguration,
@@ -260,8 +262,13 @@ export const api = {
     },
   },
   calls: {
-    async get(id: string | number) { return normalizeCall(await request<CallDetail>(`/calls/${encodeURIComponent(id)}`)); },
+    async get(id: string | number, jobId?: string) {
+      const query = jobId ? `?job_id=${encodeURIComponent(jobId)}` : "";
+      return normalizeCall(await request<CallDetail>(`/calls/${encodeURIComponent(id)}${query}`));
+    },
     retry: (id: string | number) => mutate<{ message: string }>(`/calls/${encodeURIComponent(id)}/retry`, "POST"),
+    assignSpeaker: (id: string | number, input: SpeakerAssignmentInput) =>
+      mutate<SpeakerAssignmentResult>(`/calls/${encodeURIComponent(id)}/speaker-assignment`, "PATCH", input),
     audioUrl: (id: string | number) => apiUrl(`/calls/${encodeURIComponent(id)}/audio`),
   },
 };

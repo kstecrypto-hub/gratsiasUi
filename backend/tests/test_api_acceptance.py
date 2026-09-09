@@ -31,6 +31,7 @@ from app.core.middleware import CSRFMiddleware, SecurityHeadersMiddleware
 from app.database.base import Base
 from app.database.session import get_db
 from app.models import (
+    AuditLog,
     Call,
     CallParticipant,
     Keyword,
@@ -52,14 +53,20 @@ from app.models.enums import (
     MatchMethod,
     ParticipantRole,
     RecordingStatus,
+    SpeakerAttributionStatus,
     SpeakerSource,
+    TranscriptionMode,
     TranscriptStatus,
     YeastarConnectionStatus,
 )
 from app.services.audio import AudioProcessor
 from app.services.yeastar.circuit_breaker import YEASTAR_CIRCUIT_KEY
 from app.services.yeastar.configuration_store import YEASTAR_CONFIGURATION_STATE_KEY
-from app.services.transcription.configuration_store import OPENAI_CONFIGURATION_STATE_KEY
+from app.services.transcription.configuration_store import (
+    OPENAI_CONFIGURATION_STATE_KEY,
+    OpenAIConfiguration,
+    OpenAIConfigurationStore,
+)
 from app.services.yeastar.errors import YeastarLockTimeoutError
 from app.services.yeastar.schemas import CircuitBreakerState, ConnectionState
 from app.services.yeastar.token_store import (
@@ -120,6 +127,8 @@ async def api_harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         YEASTAR_CLIENT_ID="test-client-id",
         YEASTAR_CLIENT_SECRET="test-client-secret",
         OPENAI_API_KEY="test-openai-key",
+        TRANSCRIPTION_PIPELINE_DEFAULT="legacy-v1",
+        TRANSCRIPTION_PIPELINE_V2_ENABLED=True,
         TRANSCRIPT_RETENTION_DAYS=1,
     )
     engine = create_async_engine(settings.DATABASE_URL)
@@ -141,9 +150,7 @@ async def api_harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             self.acquired = False
 
         async def acquire(self) -> bool:
-            self.acquired = bool(
-                await self.redis.set(self.key, self.owner, nx=True, px=30_000)
-            )
+            self.acquired = bool(await self.redis.set(self.key, self.owner, nx=True, px=30_000))
             if not self.acquired:
                 raise YeastarLockTimeoutError("Test lock is busy.")
             return True
@@ -233,9 +240,7 @@ async def test_secure_login_session_csrf_and_logout(api_harness: APIHarness) -> 
     preauth_token = csrf_response.json()["csrf_token"]
 
     login_payload = {"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}
-    assert (
-        await api_harness.client.post("/api/auth/login", json=login_payload)
-    ).status_code == 403
+    assert (await api_harness.client.post("/api/auth/login", json=login_payload)).status_code == 403
     assert (
         await api_harness.client.post(
             "/api/auth/login",
@@ -266,7 +271,9 @@ async def test_secure_login_session_csrf_and_logout(api_harness: APIHarness) -> 
 
     session_keys = await api_harness.redis.keys(f"{SESSION_PREFIX}*")
     assert len(session_keys) == 1
-    assert 0 < await api_harness.redis.ttl(session_keys[0]) <= api_harness.settings.SESSION_TTL_SECONDS
+    assert (
+        0 < await api_harness.redis.ttl(session_keys[0]) <= api_harness.settings.SESSION_TTL_SECONDS
+    )
     assert (await api_harness.client.get("/api/auth/me")).status_code == 200
 
     # A browser reload loses the in-memory token; /csrf must recover the token
@@ -278,9 +285,7 @@ async def test_secure_login_session_csrf_and_logout(api_harness: APIHarness) -> 
     api_harness.csrf_token = recovered.json()["csrf_token"]
 
     assert (await api_harness.client.post("/api/auth/logout")).status_code == 403
-    logout = await api_harness.client.post(
-        "/api/auth/logout", headers=api_harness.csrf_headers()
-    )
+    logout = await api_harness.client.post("/api/auth/logout", headers=api_harness.csrf_headers())
     assert logout.status_code == 200
     assert await api_harness.redis.keys(f"{SESSION_PREFIX}*") == []
     assert (await api_harness.client.get("/api/auth/me")).status_code == 401
@@ -373,9 +378,7 @@ async def test_yeastar_configuration_put_is_authenticated_csrf_safe_and_redacted
     assert await api_harness.redis.get(YEASTAR_TOKEN_STATE_KEY) is None
     assert await api_harness.redis.get(YEASTAR_CIRCUIT_KEY) is not None
 
-    safe_configuration = await api_harness.client.get(
-        "/api/settings/yeastar/configuration"
-    )
+    safe_configuration = await api_harness.client.get("/api/settings/yeastar/configuration")
     assert safe_configuration.status_code == 200
     assert safe_configuration.json()["Settings"]["ClientId"] == "[CONFIGURED]"
     assert safe_configuration.json()["Settings"]["ClientSecret"] == "[REDACTED]"
@@ -436,9 +439,7 @@ async def test_openai_configuration_put_is_authenticated_csrf_safe_and_write_onl
     assert preserved.status_code == 200
     assert preserved.json()["configuration"] == {"api_key": "[CONFIGURED]"}
 
-    safe_configuration = await api_harness.client.get(
-        "/api/settings/openai/configuration"
-    )
+    safe_configuration = await api_harness.client.get("/api/settings/openai/configuration")
     assert safe_configuration.status_code == 200
     assert safe_configuration.json() == {"api_key": "[CONFIGURED]"}
     assert sentinel not in safe_configuration.text
@@ -554,9 +555,7 @@ async def test_configuration_requires_a_live_processing_worker(
             IntegrationStatus(
                 provider="yeastar",
                 status=YeastarConnectionStatus.CONNECTED,
-                configuration_fingerprint=(
-                    api_harness.settings.yeastar_configuration_fingerprint
-                ),
+                configuration_fingerprint=(api_harness.settings.yeastar_configuration_fingerprint),
                 capabilities_json={
                     "extensions": True,
                     "cdr_v2": True,
@@ -698,7 +697,9 @@ async def test_job_progress_retry_only_failed_items_and_cancel(
     async with api_harness.sessions() as session:
         operator = await _operator(session)
         completed_call = await _call(session, started_at=now - timedelta(minutes=2))
-        failed_call = await _call(session, started_at=now - timedelta(minutes=1), has_recording=True)
+        failed_call = await _call(
+            session, started_at=now - timedelta(minutes=1), has_recording=True
+        )
         failed_recording = await _recording(session, failed_call)
         retry_job = ProcessingJob(
             idempotency_key=f"retry-job-{uuid4()}",
@@ -944,6 +945,239 @@ async def test_call_retry_uses_only_the_latest_parent_job(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("pipeline_version", ["legacy-v1", "pipeline-v2"])
+async def test_completed_call_reprocess_queues_replacement_without_unsetting_current(
+    api_harness: APIHarness,
+    monkeypatch: pytest.MonkeyPatch,
+    pipeline_version: str,
+) -> None:
+    now = datetime.now(UTC)
+    async with api_harness.sessions() as session:
+        operator = await _operator(session, "Reprocess Operator")
+        call = await _call(session, started_at=now, has_recording=True)
+        recording = await _recording(session, call)
+        source_job = ProcessingJob(
+            idempotency_key=f"source-reprocess-job-{uuid4()}",
+            requested_by_id=api_harness.admin_id,
+            status=JobStatus.COMPLETED,
+            date_from=now - timedelta(hours=1),
+            date_to=now + timedelta(hours=1),
+            selected_operator_ids=[str(operator.id)],
+            selected_category_ids=[],
+            request_filters={},
+            progress_percent=100,
+            current_stage="Complete",
+            calls_found=1,
+            recordings_found=1,
+            calls_completed=1,
+            completed_at=now,
+        )
+        session.add(source_job)
+        await session.flush()
+        transcript_id = uuid4()
+        source_item = ProcessingJobItem(
+            job_id=source_job.id,
+            call_id=call.id,
+            operator_id=operator.id,
+            recording_id=recording.id,
+            result_transcript_id=transcript_id,
+            idempotency_key=f"source-reprocess-item-{uuid4()}",
+            status=ItemStatus.COMPLETED,
+            stage="completed",
+            completed_at=now,
+        )
+        transcript = Transcript(
+            id=transcript_id,
+            call_id=call.id,
+            recording_id=recording.id,
+            operator_id=operator.id,
+            idempotency_key=f"source-reprocess-transcript-{uuid4()}",
+            status=TranscriptStatus.COMPLETED,
+            model="gpt-4o-transcribe",
+            language="el",
+            pipeline_version="legacy-v1",
+            source_audio_sha256="d" * 64,
+            is_diarized=False,
+            is_current=True,
+            completed_at=now,
+        )
+        session.add_all([source_item, transcript])
+        await session.commit()
+        call_id = call.id
+        transcript_id = transcript.id
+
+    api_harness.settings.OPENAI_API_KEY = None
+    await OpenAIConfigurationStore(
+        api_harness.redis,
+        api_harness.settings.APP_SECRET_KEY,
+    ).write(OpenAIConfiguration("ui-only-openai-key"))
+    task = CapturingTask()
+    monkeypatch.setattr(results_api, "process_job_item", task)
+    await api_harness.login()
+
+    unsupported = await api_harness.client.post(
+        f"/api/calls/{call_id}/reprocess",
+        headers=api_harness.csrf_headers(),
+        json={"pipeline_version": "pipeline-v99", "transcript_id": str(transcript_id)},
+    )
+    assert unsupported.status_code == 422
+
+    response = await api_harness.client.post(
+        f"/api/calls/{call_id}/reprocess",
+        headers=api_harness.csrf_headers(),
+        json={"pipeline_version": pipeline_version, "transcript_id": str(transcript_id)},
+    )
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["status"] == "queued"
+    assert body["current_stage"] == "Queued for reprocessing"
+    assert body["calls_found"] == 1
+    assert body["recordings_found"] == 1
+    assert len(body["items"]) == 1
+    assert body["items"][0]["requested_pipeline_version"] == pipeline_version
+    assert task.calls == [body["items"][0]["id"]]
+
+    async with api_harness.sessions() as session:
+        current = await session.get(Transcript, transcript_id)
+        call = await session.get(Call, call_id)
+        item = await session.get(ProcessingJobItem, UUID(body["items"][0]["id"]))
+        job = await session.get(ProcessingJob, UUID(body["id"]))
+        entry = await session.scalar(
+            select(AuditLog)
+            .where(AuditLog.action == "call.reprocess")
+            .order_by(AuditLog.created_at.desc())
+        )
+        assert current is not None and current.is_current is True
+        assert current.status == TranscriptStatus.COMPLETED
+        assert call is not None and call.processing_status == "completed"
+        assert item is not None
+        assert item.requested_pipeline_version == pipeline_version
+        assert item.celery_task_id == "test-task-1"
+        assert job is not None
+        assert job.request_filters["_reprocess_targets"] == {str(item.id): str(transcript_id)}
+        assert entry is not None
+        assert entry.resource_id == str(call_id)
+        assert entry.details["source_transcript_id"] == str(transcript_id)
+        assert entry.details["pipeline_version"] == pipeline_version
+        assert await session.scalar(select(func.count()).select_from(Transcript)) == 1
+
+    duplicate = await api_harness.client.post(
+        f"/api/calls/{call_id}/reprocess",
+        headers=api_harness.csrf_headers(),
+        json={"pipeline_version": pipeline_version, "transcript_id": str(transcript_id)},
+    )
+    assert duplicate.status_code == 409
+    assert "already running" in duplicate.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_unattributed_reprocess_accepts_an_explicit_source_operator(
+    api_harness: APIHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime.now(UTC)
+    async with api_harness.sessions() as session:
+        first_operator = await _operator(session, "First Shared Operator")
+        second_operator = await _operator(session, "Second Shared Operator")
+        call = await _call(session, started_at=now, has_recording=True)
+        recording = await _recording(session, call)
+        source_job = ProcessingJob(
+            idempotency_key=f"shared-reprocess-job-{uuid4()}",
+            requested_by_id=api_harness.admin_id,
+            status=JobStatus.COMPLETED,
+            date_from=now - timedelta(hours=1),
+            date_to=now + timedelta(hours=1),
+            include_all_speakers=True,
+            selected_operator_ids=[str(first_operator.id), str(second_operator.id)],
+            selected_category_ids=[],
+            request_filters={},
+            progress_percent=100,
+            current_stage="Complete",
+            calls_found=1,
+            recordings_found=1,
+            calls_completed=1,
+            completed_at=now,
+        )
+        session.add(source_job)
+        await session.flush()
+        transcript_id = uuid4()
+        source_items = [
+            ProcessingJobItem(
+                job_id=source_job.id,
+                call_id=call.id,
+                operator_id=operator.id,
+                recording_id=recording.id,
+                result_transcript_id=transcript_id,
+                idempotency_key=f"shared-reprocess-item-{operator.id}",
+                status=ItemStatus.COMPLETED,
+                stage="completed",
+                completed_at=now,
+            )
+            for operator in (first_operator, second_operator)
+        ]
+        transcript = Transcript(
+            id=transcript_id,
+            call_id=call.id,
+            recording_id=recording.id,
+            operator_id=None,
+            idempotency_key=f"shared-reprocess-transcript-{uuid4()}",
+            status=TranscriptStatus.COMPLETED,
+            model="gpt-4o-transcribe-diarize",
+            language="el",
+            pipeline_version="legacy-v1",
+            source_audio_sha256="f" * 64,
+            is_diarized=True,
+            is_current=True,
+            completed_at=now,
+        )
+        session.add_all([*source_items, transcript])
+        await session.commit()
+        call_id = call.id
+        transcript_id = transcript.id
+        selected_operator_id = second_operator.id
+
+    task = CapturingTask()
+    monkeypatch.setattr(results_api, "process_job_item", task)
+    await api_harness.login()
+
+    ambiguous = await api_harness.client.post(
+        f"/api/calls/{call_id}/reprocess",
+        headers=api_harness.csrf_headers(),
+        json={"pipeline_version": "legacy-v1", "transcript_id": str(transcript_id)},
+    )
+    assert ambiguous.status_code == 409
+    assert "choose the operator" in ambiguous.json()["detail"].lower()
+
+    queued = await api_harness.client.post(
+        f"/api/calls/{call_id}/reprocess",
+        headers=api_harness.csrf_headers(),
+        json={
+            "pipeline_version": "legacy-v1",
+            "transcript_id": str(transcript_id),
+            "operator_id": str(selected_operator_id),
+        },
+    )
+    assert queued.status_code == 202, queued.text
+    assert queued.json()["items"][0]["operator_id"] == str(selected_operator_id)
+    assert task.calls == [queued.json()["items"][0]["id"]]
+
+
+@pytest.mark.asyncio
+async def test_v2_disabled_rejects_explicit_v2_reprocess(
+    api_harness: APIHarness,
+) -> None:
+    api_harness.settings.TRANSCRIPTION_PIPELINE_V2_ENABLED = False
+    await api_harness.login()
+    response = await api_harness.client.post(
+        f"/api/calls/{uuid4()}/reprocess",
+        headers=api_harness.csrf_headers(),
+        json={"pipeline_version": "pipeline-v2"},
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Pipeline V2 is disabled."
+
+
+@pytest.mark.asyncio
 async def test_job_creation_interprets_naive_dates_as_athens_wall_time(
     api_harness: APIHarness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -953,9 +1187,7 @@ async def test_job_creation_interprets_naive_dates_as_athens_wall_time(
             IntegrationStatus(
                 provider="yeastar",
                 status=YeastarConnectionStatus.CONNECTED,
-                configuration_fingerprint=(
-                    api_harness.settings.yeastar_configuration_fingerprint
-                ),
+                configuration_fingerprint=(api_harness.settings.yeastar_configuration_fingerprint),
                 capabilities_json={},
             )
         )
@@ -1025,7 +1257,7 @@ async def test_results_filters_newest_first_and_csv_is_safe_for_spreadsheets(
 ) -> None:
     now = datetime(2026, 7, 15, 12, 0, tzinfo=UTC)
     async with api_harness.sessions() as session:
-        formula_operator = await _operator(session, "=HYPERLINK(\"https://invalid\")")
+        formula_operator = await _operator(session, '=HYPERLINK("https://invalid")')
         ordinary_operator = await _operator(session, "Operator Two")
         matched_call = await _call(
             session,
@@ -1081,6 +1313,21 @@ async def test_results_filters_newest_first_and_csv_is_safe_for_spreadsheets(
             completed_at=now,
             source_audio_sha256="a" * 64,
             is_diarized=False,
+            is_current=True,
+        )
+        superseded_transcript = Transcript(
+            call_id=matched_call.id,
+            recording_id=recording.id,
+            operator_id=formula_operator.id,
+            idempotency_key=f"superseded-transcript-{uuid4()}",
+            status=TranscriptStatus.COMPLETED,
+            model="gpt-4o-transcribe",
+            language="el",
+            pipeline_version="legacy-v0",
+            completed_at=now - timedelta(days=1),
+            source_audio_sha256="a" * 64,
+            is_diarized=False,
+            is_current=False,
         )
         direct_search_recording = await _recording(session, newer_call)
         direct_search_transcript = Transcript(
@@ -1094,8 +1341,9 @@ async def test_results_filters_newest_first_and_csv_is_safe_for_spreadsheets(
             completed_at=now,
             source_audio_sha256="b" * 64,
             is_diarized=False,
+            is_current=True,
         )
-        session.add_all([transcript, direct_search_transcript])
+        session.add_all([transcript, superseded_transcript, direct_search_transcript])
         await session.flush()
         segment = TranscriptSegment(
             transcript_id=transcript.id,
@@ -1123,7 +1371,20 @@ async def test_results_filters_newest_first_and_csv_is_safe_for_spreadsheets(
             transcription_model="gpt-4o-transcribe",
             sequence_number=1,
         )
-        session.add_all([segment, direct_search_segment])
+        superseded_segment = TranscriptSegment(
+            transcript_id=superseded_transcript.id,
+            call_id=matched_call.id,
+            operator_id=formula_operator.id,
+            speaker_label=formula_operator.display_name,
+            speaker_source=SpeakerSource.YEASTAR_EXTENSION,
+            start_seconds=Decimal("9.000"),
+            end_seconds=Decimal("12.000"),
+            original_text="Superseded-only phrase",
+            normalized_text="superseded only phrase",
+            transcription_model="gpt-4o-transcribe",
+            sequence_number=1,
+        )
+        session.add_all([segment, direct_search_segment, superseded_segment])
         await session.flush()
         match = KeywordMatch(
             keyword_id=keyword.id,
@@ -1136,6 +1397,20 @@ async def test_results_filters_newest_first_and_csv_is_safe_for_spreadsheets(
             context_after="@after",
             start_seconds=Decimal("5.000"),
             end_seconds=Decimal("6.000"),
+            match_method=MatchMethod.EXACT_PHRASE,
+            match_score=Decimal("1.000"),
+        )
+        superseded_match = KeywordMatch(
+            keyword_id=keyword.id,
+            operator_id=formula_operator.id,
+            call_id=matched_call.id,
+            transcript_segment_id=superseded_segment.id,
+            original_matched_text="dangerous keyword",
+            normalized_match="dangerous keyword",
+            context_before="superseded",
+            context_after="history",
+            start_seconds=Decimal("9.000"),
+            end_seconds=Decimal("11.000"),
             match_method=MatchMethod.EXACT_PHRASE,
             match_score=Decimal("1.000"),
         )
@@ -1157,12 +1432,32 @@ async def test_results_filters_newest_first_and_csv_is_safe_for_spreadsheets(
         )
         session.add(result_job)
         await session.flush()
+        historical_result_job = ProcessingJob(
+            idempotency_key=f"historical-results-job-{uuid4()}",
+            requested_by_id=api_harness.admin_id,
+            status=JobStatus.COMPLETED,
+            date_from=now - timedelta(days=2),
+            date_to=now,
+            selected_operator_ids=[str(formula_operator.id)],
+            selected_category_ids=[],
+            request_filters={},
+            progress_percent=100,
+            current_stage="Complete",
+            calls_found=1,
+            recordings_found=1,
+            calls_completed=1,
+            completed_at=now - timedelta(days=1),
+            created_at=now - timedelta(days=1),
+        )
+        session.add(historical_result_job)
+        await session.flush()
         result_items = [
             ProcessingJobItem(
                 job_id=result_job.id,
                 call_id=matched_call.id,
                 operator_id=formula_operator.id,
                 recording_id=recording.id,
+                result_transcript_id=transcript.id,
                 idempotency_key=f"result-item-{uuid4()}",
                 status=ItemStatus.COMPLETED,
                 stage="completed",
@@ -1173,14 +1468,32 @@ async def test_results_filters_newest_first_and_csv_is_safe_for_spreadsheets(
                 call_id=newer_call.id,
                 operator_id=ordinary_operator.id,
                 recording_id=direct_search_recording.id,
+                result_transcript_id=direct_search_transcript.id,
                 idempotency_key=f"result-item-{uuid4()}",
                 status=ItemStatus.COMPLETED,
                 stage="completed",
                 completed_at=now,
             ),
+            ProcessingJobItem(
+                job_id=historical_result_job.id,
+                call_id=matched_call.id,
+                operator_id=formula_operator.id,
+                recording_id=recording.id,
+                result_transcript_id=superseded_transcript.id,
+                idempotency_key=f"historical-result-item-{uuid4()}",
+                status=ItemStatus.COMPLETED,
+                stage="completed",
+                completed_at=now - timedelta(days=1),
+            ),
         ]
         session.add_all(
-            [matched_participant, newer_participant, match, *result_items]
+            [
+                matched_participant,
+                newer_participant,
+                match,
+                superseded_match,
+                *result_items,
+            ]
         )
         await session.commit()
         matched_call_id = matched_call.id
@@ -1189,7 +1502,9 @@ async def test_results_filters_newest_first_and_csv_is_safe_for_spreadsheets(
         category_id = category.id
         keyword_id = keyword.id
         segment_id = segment.id
+        superseded_segment_id = superseded_segment.id
         result_job_id = result_job.id
+        historical_result_job_id = historical_result_job.id
 
     await api_harness.login()
     unfiltered = await api_harness.client.get("/api/results")
@@ -1198,9 +1513,7 @@ async def test_results_filters_newest_first_and_csv_is_safe_for_spreadsheets(
         str(newer_call_id),
         str(matched_call_id),
     ]
-    assert {item["job_id"] for item in unfiltered.json()["items"]} == {
-        str(result_job_id)
-    }
+    assert {item["job_id"] for item in unfiltered.json()["items"]} == {str(result_job_id)}
     assert "+302101111111" not in unfiltered.text
 
     matched = await api_harness.client.get("/api/results", params={"has_matches": "true"})
@@ -1217,14 +1530,15 @@ async def test_results_filters_newest_first_and_csv_is_safe_for_spreadsheets(
     by_keyword = await api_harness.client.get(
         "/api/results", params={"keyword_id": str(keyword_id)}
     )
-    by_keyword_text = await api_harness.client.get(
-        "/api/results", params={"keyword": "dangerous"}
-    )
+    by_keyword_text = await api_harness.client.get("/api/results", params={"keyword": "dangerous"})
     by_transcript_text = await api_harness.client.get(
         "/api/results", params={"transcript_query": "spreadsheet-shaped"}
     )
     by_direct_transcript_text = await api_harness.client.get(
         "/api/results", params={"transcript_query": "direct-only"}
+    )
+    by_superseded_transcript_text = await api_harness.client.get(
+        "/api/results", params={"transcript_query": "superseded-only"}
     )
     outbound = await api_harness.client.get("/api/results", params={"direction": "outbound"})
     after_cutoff = await api_harness.client.get(
@@ -1239,9 +1553,7 @@ async def test_results_filters_newest_first_and_csv_is_safe_for_spreadsheets(
     assert by_keyword.json()["total"] == 1
     assert by_keyword_text.json()["total"] == 1
     assert by_keyword_text.json()["items"][0]["match_count"] == 1
-    assert by_keyword_text.json()["items"][0]["keywords_found"] == [
-        "@dangerous keyword"
-    ]
+    assert by_keyword_text.json()["items"][0]["keywords_found"] == ["@dangerous keyword"]
     assert by_transcript_text.json()["total"] == 1
     assert [item["call_id"] for item in by_transcript_text.json()["items"]] == [
         str(matched_call_id)
@@ -1250,6 +1562,27 @@ async def test_results_filters_newest_first_and_csv_is_safe_for_spreadsheets(
         str(newer_call_id)
     ]
     assert by_direct_transcript_text.json()["items"][0]["match_count"] == 0
+    assert by_superseded_transcript_text.status_code == 200
+    assert by_superseded_transcript_text.json()["total"] == 0
+    historical_by_superseded_text = await api_harness.client.get(
+        "/api/results",
+        params={
+            "job_id": str(historical_result_job_id),
+            "transcript_query": "superseded-only",
+        },
+    )
+    historical_by_current_text = await api_harness.client.get(
+        "/api/results",
+        params={
+            "job_id": str(historical_result_job_id),
+            "transcript_query": "spreadsheet-shaped",
+        },
+    )
+    assert historical_by_superseded_text.status_code == 200
+    assert historical_by_superseded_text.json()["total"] == 1
+    assert historical_by_superseded_text.json()["items"][0]["match_count"] == 1
+    assert historical_by_current_text.status_code == 200
+    assert historical_by_current_text.json()["total"] == 0
     assert [item["call_id"] for item in outbound.json()["items"]] == [str(newer_call_id)]
     assert after_cutoff.status_code == 200, after_cutoff.text
     assert [item["call_id"] for item in after_cutoff.json()["items"]] == [str(newer_call_id)]
@@ -1262,9 +1595,25 @@ async def test_results_filters_newest_first_and_csv_is_safe_for_spreadsheets(
     assert contradictory.status_code == 422
 
     detail = await api_harness.client.get(f"/api/calls/{matched_call_id}")
+    historical_detail = await api_harness.client.get(
+        f"/api/calls/{matched_call_id}",
+        params={"job_id": str(historical_result_job_id)},
+    )
     assert detail.status_code == 200, detail.text
     assert detail.json()["matches"][0]["transcript_segment_id"] == str(segment_id)
-    assert detail.json()["transcript_segments"][0]["id"] == str(segment_id)
+    assert [item["id"] for item in detail.json()["transcript_segments"]] == [str(segment_id)]
+    assert len(detail.json()["matches"]) == 1
+    assert historical_detail.status_code == 200, historical_detail.text
+    assert [item["id"] for item in historical_detail.json()["transcript_segments"]] == [
+        str(superseded_segment_id)
+    ]
+
+    dashboard = await api_harness.client.get("/api/dashboard")
+    assert dashboard.status_code == 200, dashboard.text
+    assert dashboard.json()["calls_transcribed"] == 2
+    assert dashboard.json()["calls_with_matches"] == 1
+    assert dashboard.json()["results_by_operator"][0]["match_count"] == 1
+    assert dashboard.json()["results_by_keyword_category"][0]["match_count"] == 1
 
     operator_ascending = await api_harness.client.get(
         "/api/results", params={"sort": "operator", "order": "asc"}
@@ -1407,15 +1756,11 @@ async def test_current_results_replace_the_view_but_history_remains_searchable(
     jobs = await api_harness.client.get("/api/jobs")
 
     assert current.status_code == 200
-    assert [item["call_id"] for item in current.json()["items"]] == [
-        str(current_call_id)
-    ]
+    assert [item["call_id"] for item in current.json()["items"]] == [str(current_call_id)]
     assert current.json()["items"][0]["job_id"] == str(current_job_id)
     assert current.json()["items"][0]["processing_status"] == "completed"
     assert historical.status_code == 200
-    assert [item["call_id"] for item in historical.json()["items"]] == [
-        str(historical_call_id)
-    ]
+    assert [item["call_id"] for item in historical.json()["items"]] == [str(historical_call_id)]
     assert historical.json()["items"][0]["processing_status"] == "failed"
     assert jobs.status_code == 200
     assert [item["id"] for item in jobs.json()["items"]] == [
@@ -1479,6 +1824,113 @@ async def test_audio_streaming_requires_authentication_and_honors_byte_ranges(
     assert unsatisfiable.status_code == 416
     assert unsatisfiable.headers["content-range"] == f"bytes */{len(payload)}"
     assert unsatisfiable.content == b""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "requested_pipeline_version",
+    [
+        pytest.param("legacy-v1", id="explicit-reprocess"),
+        pytest.param(None, id="ordinary-reuse"),
+    ],
+)
+async def test_retention_preserves_transcripts_during_active_processing(
+    api_harness: APIHarness,
+    monkeypatch: pytest.MonkeyPatch,
+    requested_pipeline_version: str | None,
+) -> None:
+    now = datetime.now(UTC)
+    async with api_harness.sessions() as session:
+        operator = await _operator(session, "Retention Reprocess Operator")
+        call = await _call(
+            session,
+            started_at=now - timedelta(days=400),
+            has_recording=True,
+        )
+        recording = await _recording(session, call)
+        job = ProcessingJob(
+            idempotency_key=f"retention-reprocess-job-{uuid4()}",
+            requested_by_id=api_harness.admin_id,
+            status=JobStatus.TRANSCRIBING,
+            date_from=call.started_at,
+            date_to=call.started_at + timedelta(hours=1),
+            selected_operator_ids=[str(operator.id)],
+            selected_category_ids=[],
+            request_filters={},
+            current_stage="Transcribing conversations",
+            calls_found=1,
+            recordings_found=1,
+        )
+        session.add(job)
+        await session.flush()
+        transcript = Transcript(
+            call_id=call.id,
+            recording_id=recording.id,
+            operator_id=operator.id,
+            idempotency_key=f"retention-reprocess-transcript-{uuid4()}",
+            status=TranscriptStatus.COMPLETED,
+            model="gpt-4o-transcribe",
+            language="el",
+            completed_at=now - timedelta(days=399),
+            source_audio_sha256="e" * 64,
+            is_diarized=False,
+            is_current=True,
+        )
+        session.add(transcript)
+        await session.flush()
+        replacement = Transcript(
+            call_id=call.id,
+            recording_id=recording.id,
+            operator_id=operator.id,
+            idempotency_key=f"retention-replacement-{uuid4()}",
+            status=TranscriptStatus.COMPLETED,
+            model="gpt-4o-transcribe",
+            language="el",
+            completed_at=now - timedelta(days=398),
+            source_audio_sha256="e" * 64,
+            is_diarized=False,
+            supersedes_transcript_id=transcript.id,
+            is_current=False,
+        )
+        item = ProcessingJobItem(
+            job_id=job.id,
+            call_id=call.id,
+            operator_id=operator.id,
+            recording_id=recording.id,
+            idempotency_key=f"retention-reprocess-item-{uuid4()}",
+            requested_pipeline_version=requested_pipeline_version,
+            status=ItemStatus.PROCESSING,
+            stage="transcribing",
+        )
+        session.add_all([replacement, item])
+        await session.commit()
+        transcript_id = transcript.id
+        replacement_id = replacement.id
+        job_id = job.id
+        item_id = item.id
+
+    monkeypatch.setattr(pipeline_module, "AsyncSessionFactory", api_harness.sessions)
+    monkeypatch.setattr(pipeline_module, "get_settings", lambda: api_harness.settings)
+
+    protected = await cleanup_retention_records()
+    assert protected["transcripts_deleted"] == 0
+    async with api_harness.sessions() as session:
+        assert await session.get(Transcript, transcript_id) is not None
+        assert await session.get(Transcript, replacement_id) is not None
+        job = await session.get(ProcessingJob, job_id)
+        item = await session.get(ProcessingJobItem, item_id)
+        assert job is not None and item is not None
+        job.status = JobStatus.FAILED
+        job.completed_at = now
+        item.status = ItemStatus.FAILED
+        item.completed_at = now
+        await session.commit()
+
+    released = await cleanup_retention_records()
+    assert released["transcripts_deleted"] == 2
+    async with api_harness.sessions() as session:
+        assert await session.get(Transcript, transcript_id) is None
+        assert await session.get(Transcript, replacement_id) is None
 
 
 @pytest.mark.asyncio
@@ -1562,3 +2014,441 @@ async def test_retention_cleanup_retries_failed_audio_deletion_on_next_run(
         assert cleaned.deleted_at is not None
         assert cleaned.last_error_category is None
         assert cleaned.last_error_message is None
+
+
+async def _seed_speaker_assignment_call(
+    api_harness: APIHarness,
+    *,
+    mode: TranscriptionMode = TranscriptionMode.DUAL_CHANNEL,
+    attribution: SpeakerAttributionStatus = SpeakerAttributionStatus.CHANNEL_UNKNOWN,
+    channel_texts: dict[int, str] | None = None,
+) -> dict[str, UUID]:
+    texts = channel_texts or {0: "προσφορά σήμερα", 1: "Έχω μια ερώτηση"}
+    async with api_harness.sessions() as session:
+        operator = Operator(
+            yeastar_extension_id="ext-assign-201",
+            extension_number="201",
+            display_name="Maria",
+            last_synced_at=datetime.now(UTC),
+        )
+        session.add(operator)
+        await session.flush()
+        call = Call(
+            yeastar_uid="call-assign-201",
+            yeastar_id="call-assign-201",
+            started_at=datetime.now(UTC),
+            direction=Direction.INBOUND,
+            duration_seconds=60,
+            processing_status="completed",
+        )
+        session.add(call)
+        await session.flush()
+        session.add(
+            CallParticipant(
+                call_id=call.id,
+                operator_id=operator.id,
+                role=ParticipantRole.ANSWERING_OPERATOR,
+                answered=True,
+                attribution_source=SpeakerSource.UNKNOWN,
+            )
+        )
+        recording = Recording(
+            call_id=call.id,
+            yeastar_recording_id="rec-assign-201",
+            channel_count=2,
+            status=RecordingStatus.COMPLETED,
+        )
+        session.add(recording)
+        await session.flush()
+        transcript = Transcript(
+            call_id=call.id,
+            recording_id=recording.id,
+            operator_id=None,
+            idempotency_key=f"assign-{uuid4().hex}",
+            status=TranscriptStatus.COMPLETED,
+            model="gpt-4o-transcribe",
+            language="el",
+            source_audio_sha256="a" * 64,
+            is_diarized=False,
+            transcription_mode=mode,
+            speaker_attribution_status=attribution,
+            pipeline_version="pipeline-v2",
+            is_current=True,
+            original_text=" ".join(texts.values()),
+            normalized_text=" ".join(texts.values()),
+        )
+        session.add(transcript)
+        await session.flush()
+        for sequence, channel in enumerate(sorted(texts), start=1):
+            session.add(
+                TranscriptSegment(
+                    transcript_id=transcript.id,
+                    call_id=call.id,
+                    operator_id=None,
+                    speaker_label=f"Channel {'A' if channel == 0 else 'B'}",
+                    speaker_source=SpeakerSource.UNKNOWN,
+                    start_seconds=Decimal("0"),
+                    end_seconds=Decimal("5"),
+                    original_text=texts[channel],
+                    normalized_text=texts[channel],
+                    transcription_model="gpt-4o-transcribe",
+                    sequence_number=sequence,
+                    channel_index=channel,
+                )
+            )
+        await session.commit()
+        return {
+            "operator_id": operator.id,
+            "call_id": call.id,
+            "transcript_id": transcript.id,
+            "recording_id": recording.id,
+        }
+
+
+@pytest.mark.asyncio
+async def test_speaker_assignment_updates_segments_rebuilds_matches_and_audits(
+    api_harness: APIHarness,
+) -> None:
+    ids = await _seed_speaker_assignment_call(api_harness)
+    await api_harness.login()
+
+    async with api_harness.sessions() as session:
+        category = KeywordCategory(name="Sales")
+        session.add(category)
+        await session.flush()
+        keyword = Keyword(
+            category_id=category.id,
+            canonical_phrase="προσφορά",
+            normalized_phrase="προσφορά",
+            accent_insensitive=True,
+            whole_word=True,
+            exact_phrase=True,
+            fuzzy_match=False,
+            fuzzy_threshold=90,
+            active=True,
+        )
+        session.add(keyword)
+        await session.flush()
+        channel_one_segment = await session.scalar(
+            select(TranscriptSegment).where(
+                TranscriptSegment.transcript_id == ids["transcript_id"],
+                TranscriptSegment.channel_index == 1,
+            )
+        )
+        assert channel_one_segment is not None
+        session.add(
+            KeywordMatch(
+                keyword_id=keyword.id,
+                operator_id=None,
+                call_id=ids["call_id"],
+                transcript_segment_id=channel_one_segment.id,
+                original_matched_text="προσφορά",
+                normalized_match="προσφορά",
+                context_before="",
+                context_after="",
+                start_seconds=Decimal("0"),
+                end_seconds=Decimal("5"),
+                match_method=MatchMethod.EXACT_PHRASE,
+                match_score=Decimal("100"),
+            )
+        )
+        await session.commit()
+
+    response = await api_harness.client.patch(
+        f"/api/calls/{ids['call_id']}/speaker-assignment",
+        json={
+            "transcript_id": str(ids["transcript_id"]),
+            "operator_id": str(ids["operator_id"]),
+            "operator_channel_index": 0,
+        },
+        headers=api_harness.csrf_headers(),
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["speaker_attribution_status"] == "manually_assigned"
+    assert response.json()["speaker_assignment_required"] is False
+    assert response.json()["available_channels"] == [0, 1]
+
+    async with api_harness.sessions() as session:
+        transcript = await session.get(Transcript, ids["transcript_id"])
+        assert transcript is not None
+        assert transcript.operator_id == ids["operator_id"]
+        assert transcript.speaker_attribution_status == SpeakerAttributionStatus.MANUALLY_ASSIGNED
+
+        segments = (
+            await session.scalars(
+                select(TranscriptSegment).where(
+                    TranscriptSegment.transcript_id == transcript.id
+                )
+            )
+        ).all()
+        by_channel = {segment.channel_index: segment for segment in segments}
+        assert by_channel[0].operator_id == ids["operator_id"]
+        assert by_channel[0].speaker_source == SpeakerSource.MANUAL_OVERRIDE
+        assert by_channel[0].speaker_label == "Maria"
+        assert by_channel[1].operator_id is None
+        assert by_channel[1].speaker_label == "Customer"
+
+        matches = (
+            await session.scalars(
+                select(KeywordMatch).where(
+                    KeywordMatch.transcript_segment_id.in_([segment.id for segment in segments])
+                )
+            )
+        ).all()
+        assert matches
+        assert all(match.operator_id == ids["operator_id"] for match in matches)
+        assert {match.transcript_segment_id for match in matches} == {by_channel[0].id}
+
+        audit_row = await session.scalar(
+            select(AuditLog).where(
+                AuditLog.action == "call.speaker_assignment",
+                AuditLog.resource_type == "transcript",
+                AuditLog.resource_id == str(ids["transcript_id"]),
+            )
+        )
+        assert audit_row is not None
+        assert audit_row.details["operator_channel_index"] == 0
+        assert "transcript text" not in str(audit_row.details)
+
+
+@pytest.mark.asyncio
+async def test_speaker_assignment_rejects_transcript_from_another_call(
+    api_harness: APIHarness,
+) -> None:
+    ids = await _seed_speaker_assignment_call(api_harness)
+    async with api_harness.sessions() as session:
+        other_call = Call(
+            yeastar_uid="call-assign-other",
+            yeastar_id="call-assign-other",
+            started_at=datetime.now(UTC),
+            direction=Direction.INBOUND,
+            duration_seconds=60,
+        )
+        session.add(other_call)
+        await session.commit()
+        other_call_id = other_call.id
+
+    await api_harness.login()
+    response = await api_harness.client.patch(
+        f"/api/calls/{other_call_id}/speaker-assignment",
+        json={
+            "transcript_id": str(ids["transcript_id"]),
+            "operator_id": str(ids["operator_id"]),
+            "operator_channel_index": 0,
+        },
+        headers=api_harness.csrf_headers(),
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "The transcript does not belong to this call."
+
+
+@pytest.mark.asyncio
+async def test_speaker_assignment_rejects_mono_diarization(
+    api_harness: APIHarness,
+) -> None:
+    ids = await _seed_speaker_assignment_call(
+        api_harness,
+        mode=TranscriptionMode.MONO_DIARIZATION,
+        attribution=SpeakerAttributionStatus.ANONYMOUS_DIARIZATION,
+        channel_texts={0: "anonymous speaker"},
+    )
+    await api_harness.login()
+    response = await api_harness.client.patch(
+        f"/api/calls/{ids['call_id']}/speaker-assignment",
+        json={
+            "transcript_id": str(ids["transcript_id"]),
+            "operator_id": str(ids["operator_id"]),
+            "operator_channel_index": 0,
+        },
+        headers=api_harness.csrf_headers(),
+    )
+    assert response.status_code == 409
+    assert (
+        response.json()["detail"]
+        == "Manual assignment is only available for separated dual-channel transcripts."
+    )
+
+
+@pytest.mark.asyncio
+async def test_speaker_assignment_rejects_missing_channel(
+    api_harness: APIHarness,
+) -> None:
+    ids = await _seed_speaker_assignment_call(api_harness, channel_texts={0: "only one channel"})
+    await api_harness.login()
+    response = await api_harness.client.patch(
+        f"/api/calls/{ids['call_id']}/speaker-assignment",
+        json={
+            "transcript_id": str(ids["transcript_id"]),
+            "operator_id": str(ids["operator_id"]),
+            "operator_channel_index": 1,
+        },
+        headers=api_harness.csrf_headers(),
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"] == "The requested channel is not present in this transcript."
+
+
+@pytest.mark.asyncio
+async def test_speaker_assignment_reassigns_to_other_channel_transactionally(
+    api_harness: APIHarness,
+) -> None:
+    ids = await _seed_speaker_assignment_call(
+        api_harness,
+        channel_texts={0: "προσφορά", 1: "προσφορά"},
+    )
+    async with api_harness.sessions() as session:
+        category = KeywordCategory(name="Sales")
+        session.add(category)
+        await session.flush()
+        session.add(
+            Keyword(
+                category_id=category.id,
+                canonical_phrase="προσφορά",
+                normalized_phrase="προσφορά",
+                accent_insensitive=True,
+                whole_word=True,
+                exact_phrase=True,
+                fuzzy_match=False,
+                fuzzy_threshold=90,
+                active=True,
+            )
+        )
+        await session.commit()
+    await api_harness.login()
+
+    first = await api_harness.client.patch(
+        f"/api/calls/{ids['call_id']}/speaker-assignment",
+        json={
+            "transcript_id": str(ids["transcript_id"]),
+            "operator_id": str(ids["operator_id"]),
+            "operator_channel_index": 0,
+        },
+        headers=api_harness.csrf_headers(),
+    )
+    assert first.status_code == 200, first.text
+
+    second = await api_harness.client.patch(
+        f"/api/calls/{ids['call_id']}/speaker-assignment",
+        json={
+            "transcript_id": str(ids["transcript_id"]),
+            "operator_id": str(ids["operator_id"]),
+            "operator_channel_index": 1,
+        },
+        headers=api_harness.csrf_headers(),
+    )
+    assert second.status_code == 200, second.text
+
+    async with api_harness.sessions() as session:
+        transcript = await session.get(Transcript, ids["transcript_id"])
+        assert transcript is not None
+        assert transcript.speaker_attribution_status == SpeakerAttributionStatus.MANUALLY_ASSIGNED
+        segments = (
+            await session.scalars(
+                select(TranscriptSegment).where(
+                    TranscriptSegment.transcript_id == transcript.id
+                )
+            )
+        ).all()
+        by_channel = {segment.channel_index: segment for segment in segments}
+        assert by_channel[1].operator_id == ids["operator_id"]
+        assert by_channel[1].speaker_source == SpeakerSource.MANUAL_OVERRIDE
+        assert by_channel[0].operator_id is None
+        matches = (
+            await session.scalars(
+                select(KeywordMatch).where(
+                    KeywordMatch.transcript_segment_id.in_([segment.id for segment in segments])
+                )
+            )
+        ).all()
+        assert matches
+        assert {match.transcript_segment_id for match in matches} == {by_channel[1].id}
+
+
+@pytest.mark.asyncio
+async def test_speaker_assignment_rollback_preserves_previous_state(
+    api_harness: APIHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ids = await _seed_speaker_assignment_call(api_harness)
+    await api_harness.login()
+
+    async def raise_rebuild_failure(*_args: object, **_kwargs: object) -> int:
+        raise RuntimeError("forced rebuild failure")
+
+    monkeypatch.setattr(results_api, "_rebuild_operator_matches", raise_rebuild_failure)
+
+    with pytest.raises(RuntimeError):
+        await api_harness.client.patch(
+            f"/api/calls/{ids['call_id']}/speaker-assignment",
+            json={
+                "transcript_id": str(ids["transcript_id"]),
+                "operator_id": str(ids["operator_id"]),
+                "operator_channel_index": 0,
+            },
+            headers=api_harness.csrf_headers(),
+        )
+
+    async with api_harness.sessions() as session:
+        transcript = await session.get(Transcript, ids["transcript_id"])
+        assert transcript is not None
+        assert transcript.operator_id is None
+        assert transcript.speaker_attribution_status == SpeakerAttributionStatus.CHANNEL_UNKNOWN
+        segments = (
+            await session.scalars(
+                select(TranscriptSegment).where(
+                    TranscriptSegment.transcript_id == transcript.id
+                )
+            )
+        ).all()
+        assert all(segment.operator_id is None for segment in segments)
+        assert all(segment.speaker_source == SpeakerSource.UNKNOWN for segment in segments)
+
+
+@pytest.mark.asyncio
+async def test_speaker_assignment_concurrent_requests_leave_consistent_state(
+    api_harness: APIHarness,
+) -> None:
+    ids = await _seed_speaker_assignment_call(api_harness)
+    await api_harness.login()
+    payload_zero = {
+        "transcript_id": str(ids["transcript_id"]),
+        "operator_id": str(ids["operator_id"]),
+        "operator_channel_index": 0,
+    }
+    payload_one = {
+        **payload_zero,
+        "operator_channel_index": 1,
+    }
+    import asyncio
+
+    first, second = await asyncio.gather(
+        api_harness.client.patch(
+            f"/api/calls/{ids['call_id']}/speaker-assignment",
+            json=payload_zero,
+            headers=api_harness.csrf_headers(),
+        ),
+        api_harness.client.patch(
+            f"/api/calls/{ids['call_id']}/speaker-assignment",
+            json=payload_one,
+            headers=api_harness.csrf_headers(),
+        ),
+    )
+    assert first.status_code in {200, 409}, first.text
+    assert second.status_code in {200, 409}, second.text
+
+    async with api_harness.sessions() as session:
+        transcript = await session.get(Transcript, ids["transcript_id"])
+        assert transcript is not None
+        assert transcript.speaker_attribution_status == SpeakerAttributionStatus.MANUALLY_ASSIGNED
+        segments = (
+            await session.scalars(
+                select(TranscriptSegment).where(
+                    TranscriptSegment.transcript_id == transcript.id
+                )
+            )
+        ).all()
+        attributed = [segment for segment in segments if segment.operator_id is not None]
+        unattributed = [segment for segment in segments if segment.operator_id is None]
+        assert len(attributed) == 1
+        assert len(unattributed) == 1
+        assert attributed[0].speaker_source == SpeakerSource.MANUAL_OVERRIDE
