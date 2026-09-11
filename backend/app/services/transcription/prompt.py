@@ -11,7 +11,7 @@ from app.services.transcription.types import AudioPlan, AudioTrack
 
 
 GREEK_CALLCENTER_PROMPT_VERSION = "greek-callcenter-v2"
-GREEK_CALLCENTER_RENDERER_VERSION = "greek-callcenter-renderer-v1"
+GREEK_CALLCENTER_RENDERER_VERSION = "greek-callcenter-renderer-v2"
 RANKED_VOCABULARY_VERSION = "ranked-vocabulary-v1"
 SAME_TRACK_CONTEXT_POLICY_VERSION = "previous-accepted-same-track-tail-v1"
 GLOBAL_CONVERSATION_CONTEXT_POLICY_VERSION = (
@@ -22,6 +22,7 @@ MAX_VOCABULARY_CHARACTERS = 3000
 MAX_PREVIOUS_CONTEXT_CHARACTERS = 500
 MAX_INDIVIDUAL_TERM_CHARACTERS = 100
 MAX_PROMPT_CHARACTERS = 5000
+MAX_TRANSCRIPTION_KEYWORDS = 64
 
 GREEK_CALLCENTER_INSTRUCTIONS = (
     "Αυτή είναι ελληνική τηλεφωνική συνομιλία.",
@@ -215,6 +216,14 @@ class RankedVocabularyManifest:
     text: str = field(repr=False)
     vocabulary_hash: str
 
+    @property
+    def keywords(self) -> tuple[str, ...]:
+        # Use only the bounded, sanitized, role-filtered vocabulary. Bare PBX
+        # numbers are context, not spelling hints for spoken registration numbers.
+        return tuple(
+            term.value for term in self.terms if any(char.isalpha() for char in term.value)
+        )[:MAX_TRANSCRIPTION_KEYWORDS]
+
     def identity(self) -> dict[str, object]:
         return {
             "schema": RANKED_VOCABULARY_VERSION,
@@ -234,6 +243,7 @@ class PromptPlan:
     track_id: str | None = None
     track_role: TrackRoleValue | None = None
     previous_context_characters: int = 0
+    keywords: tuple[str, ...] = field(default=(), repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,6 +261,7 @@ class V2PromptManifest:
             "limits": self.limits.identity(),
             "prompt_identity": self.prompt_identity,
             "renderer_version": GREEK_CALLCENTER_RENDERER_VERSION,
+            "maximum_transcription_keywords": MAX_TRANSCRIPTION_KEYWORDS,
             "template_hash": _sha256_text(GREEK_CALLCENTER_TEMPLATE),
             "template_version": self.template_version,
             "tracks": [
@@ -302,6 +313,37 @@ class V2PromptManifest:
             track_id=track.track_id,
             track_role=track.track_role,
             previous_context_characters=len(context),
+            keywords=track.keywords,
+        )
+
+    def build_conversation(self, track_id: str) -> PromptPlan:
+        """Prompt the complete mixed recording, without a single-speaker role."""
+
+        track = self.track(track_id)
+        if (
+            track.track_role != TRACK_ROLE_ANONYMOUS
+            or self.context_policy != GLOBAL_CONVERSATION_CONTEXT_POLICY_VERSION
+        ):
+            raise ValueError("Conversation prompting requires a mono V2 prompt manifest.")
+        sections = [
+            GREEK_CALLCENTER_TEMPLATE,
+            "Μετάγραψε όλους τους ομιλητές με τη σειρά που ακούγονται, "
+            "χωρίς ετικέτες ομιλητών.",
+        ]
+        if track.text:
+            sections.append(f"Σχετικό λεξιλόγιο κατά σειρά προτεραιότητας:\n{track.text}")
+        text = "\n\n".join(sections)
+        if len(text) > self.limits.maximum_prompt_characters:
+            raise ValueError("The rendered V2 prompt exceeds its configured limit.")
+        return PromptPlan(
+            text=text,
+            version=self.prompt_identity,
+            prompt_hash=_sha256_text(text),
+            template_version=self.template_version,
+            vocabulary_hash=track.vocabulary_hash,
+            track_id=track.track_id,
+            track_role=track.track_role,
+            keywords=track.keywords,
         )
 
     def build_anonymous(
@@ -364,6 +406,7 @@ class V2PromptManifest:
             track_id=track.track_id,
             track_role=track.track_role,
             previous_context_characters=len(context),
+            keywords=track.keywords,
         )
 
 
@@ -416,6 +459,7 @@ class V2GreekPromptBuilder:
                 "context_policy": context_policy,
                 "limits": self.limits.identity(),
                 "renderer_version": GREEK_CALLCENTER_RENDERER_VERSION,
+                "maximum_transcription_keywords": MAX_TRANSCRIPTION_KEYWORDS,
                 "template_hash": _sha256_text(GREEK_CALLCENTER_TEMPLATE),
                 "template_version": GREEK_CALLCENTER_PROMPT_VERSION,
                 "vocabulary": vocabulary_payload,

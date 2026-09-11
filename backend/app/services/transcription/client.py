@@ -233,7 +233,10 @@ class OpenAITranscriptionClient:
                             model=self.settings.OPENAI_TRANSCRIPTION_MODEL,
                             prompt=prompt or None,
                             response_format="json",
-                            extra_body={"languages": [language]},
+                            extra_body={
+                                "languages": [language],
+                                **({"keywords": list(prompt_plan.keywords)} if prompt_plan.keywords else {}),
+                            },
                         )
                     elif logprob_contract_supported:
                         response = await client.with_options(

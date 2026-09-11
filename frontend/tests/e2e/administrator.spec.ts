@@ -8,7 +8,11 @@ test("retranscription queues the displayed transcript and opens its processing j
     if (request.pathname === "/features") return { body: { transcription_v2_enabled: true } };
     if (request.pathname === "/calls/call-quality") return { body: {
       id: "call-quality", transcript_id: "transcript-old", processing_status: "completed",
-      transcript_segments: [], matches: [],
+      transcript_segments: [{
+        id: "continuous-segment", original_text: "Sample conversation.",
+        start_timestamp: 1, end_timestamp: 3, speaker_label: "Unknown",
+        speaker_source: "unknown", quality_flags: ["approximate_timestamps", "speaker_alignment_uncertain"],
+      }], matches: [],
     } };
     if (request.pathname === "/calls/call-quality/reprocess") {
       expect(request.method).toBe("POST");
@@ -21,6 +25,8 @@ test("retranscription queues the displayed transcript and opens its processing j
     } };
   });
   await page.goto("/calls/call-quality");
+  await expect(page.getByText("Speaker timestamps are approximate", { exact: false })).toBeVisible();
+  await expect(page.getByText("Sample conversation.", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Retranscribe audio" }).click();
   await expect(page).toHaveURL(/\/processing\/quality-job$/);
   expect(submitted).toEqual({ transcript_id: "transcript-old", pipeline_version: "pipeline-v2" });

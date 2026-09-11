@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import secrets
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Mapping
@@ -77,6 +78,14 @@ from app.services.transcription.configuration_store import (
     load_effective_openai_settings,
 )
 from app.services.transcription.mono import DEFAULT_MONO_REFINEMENT_POLICY
+from app.services.transcription.conversation import (
+    CONVERSATION_ALIGNMENT_VERSION,
+    MAX_ALIGNMENT_TOKEN_PRODUCT,
+    MIN_ALIGNMENT_MATCH_RATIO,
+    MIN_RELIABLE_TURN_SECONDS,
+    MIN_SHORT_TURN_MATCH_RATIO,
+    SHORT_TURN_SECONDS,
+)
 from app.services.transcription.orchestrator import (
     PartialTranscriptionCancelledError,
     PartialTranscriptionError,
@@ -375,6 +384,17 @@ def _pipeline_v2_runtime_config_hash(
         canonical["mono_refinement"] = (
             mono_refinement_identity or DEFAULT_MONO_REFINEMENT_POLICY.identity()
         )
+        if resolved_standard_model == "gpt-transcribe":
+            canonical["mono_conversation"] = {
+                "strategy": CONVERSATION_ALIGNMENT_VERSION,
+                "complete_prepared_audio": True,
+                "minimum_reliable_turn_seconds": MIN_RELIABLE_TURN_SECONDS,
+                "maximum_alignment_token_product": MAX_ALIGNMENT_TOKEN_PRODUCT,
+                "minimum_alignment_match_ratio": MIN_ALIGNMENT_MATCH_RATIO,
+                "short_turn_seconds": SHORT_TURN_SECONDS,
+                "minimum_short_turn_match_ratio": MIN_SHORT_TURN_MATCH_RATIO,
+                "prompt": "greek-all-speakers-no-labels-v1",
+            }
     if prompted_standard_v2:
         policy = DEFAULT_CONFIDENCE_POLICY
         canonical["confidence_retry"] = {
@@ -3753,6 +3773,9 @@ def _validate_transcription_attempts(
     for attempt in result.attempts:
         grouped.setdefault((attempt.track_id, attempt.chunk_index), []).append(attempt)
     if result.mode == "mono_diarization":
+        if (result.quality_summary or {}).get("strategy") == CONVERSATION_ALIGNMENT_VERSION:
+            _validate_conversation_attempts(result)
+            return
         _validate_attempt_evidence(result.attempts, allow_unselected=True)
         segment_groups: set[tuple[str, int]] = set()
         for segment in result.segments:
@@ -3796,6 +3819,32 @@ def _validate_transcription_attempts(
             "Each standard V2 segment must have selected attempt evidence "
             f"for {missing_identity[0]} chunk {missing_identity[1]}."
         )
+
+
+def _validate_conversation_attempts(result: OrchestratedTranscriptionResult) -> None:
+    """One full-recording attempt may support several aligned speaker segments."""
+
+    _validate_attempt_evidence(result.attempts)
+    selected = [attempt for attempt in result.attempts if attempt.selected]
+    if len(selected) != 1 or not result.segments:
+        raise ValueError("Continuous mono transcription requires one selected audio attempt.")
+    attempt = selected[0]
+    if " ".join(result.text.split()) != " ".join((attempt.response_text or "").split()):
+        raise ValueError("Conversation alignment must preserve all selected transcription text.")
+    for segment in result.segments:
+        if (segment.track_id, segment.chunk_index) != (attempt.track_id, attempt.chunk_index):
+            raise ValueError("Conversation segments must reference the selected audio attempt.")
+        if segment.operator_id is not None or segment.channel_index is not None:
+            raise ValueError("Anonymous mono segments cannot be assigned to an operator or channel.")
+        if not attempt.start_seconds <= segment.start_seconds <= segment.end_seconds <= attempt.end_seconds:
+            raise ValueError("Conversation segment times must remain within the selected audio.")
+        if "approximate_timestamps" not in segment.quality_flags:
+            raise ValueError("Conversation placement must disclose approximate timestamps.")
+        if segment.speaker_source == SpeakerSource.UNKNOWN.value:
+            if segment.speaker_label != "Unknown" or "speaker_alignment_uncertain" not in segment.quality_flags:
+                raise ValueError("Uncertain conversation speakers must stay explicitly unknown.")
+        elif segment.speaker_source != SpeakerSource.OPENAI_DIARIZATION.value or re.fullmatch(r"[A-Z]", segment.speaker_label) is None:
+            raise ValueError("Conversation speakers must retain anonymous diarization evidence.")
 
 
 def _validate_attempt_evidence(

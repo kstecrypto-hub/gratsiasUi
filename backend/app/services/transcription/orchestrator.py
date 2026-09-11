@@ -41,6 +41,10 @@ from app.services.transcription.confidence import (
     select_preferred_attempt,
 )
 from app.services.transcription.merge import merge_track_results
+from app.services.transcription.conversation import (
+    CONVERSATION_ALIGNMENT_VERSION,
+    align_conversation,
+)
 from app.services.transcription.mono import (
     DEFAULT_MONO_REFINEMENT_POLICY,
     AnonymousDiarizationTurn,
@@ -501,6 +505,14 @@ class TranscriptionOrchestrator:
             except (TypeError, ValueError):
                 continue
         rejected_turn_count = len(pass1.segments) - len(valid_turns)
+        if self.settings.OPENAI_TRANSCRIPTION_MODEL == "gpt-transcribe":
+            return await self._transcribe_mono_conversation(
+                client, plan, track, context,
+                pass1=pass1,
+                valid_turns=tuple(valid_turns),
+                recording_duration=recording_duration,
+                cancellation_check=cancellation_check,
+            )
         spans = coalesce_anonymous_turns(
             valid_turns,
             self.mono_refinement_policy,
@@ -713,6 +725,125 @@ class TranscriptionOrchestrator:
             plan_reason=plan.reason,
             attempts=tuple(attempts),
             quality_summary=quality_summary,
+        )
+
+    async def _transcribe_mono_conversation(
+        self,
+        client: OpenAITranscriptionClient,
+        plan: AudioPlan,
+        track: AudioTrack,
+        context: TranscriptionContext,
+        *,
+        pass1: TranscriptionResult,
+        valid_turns: tuple[AnonymousDiarizationTurn, ...],
+        recording_duration: float,
+        cancellation_check: Callable[[], Awaitable[bool]] | None,
+    ) -> OrchestratedTranscriptionResult:
+        manifest = context.v2_prompt_manifest
+        assert manifest is not None
+        quality: dict[str, object] = {
+            "strategy": CONVERSATION_ALIGNMENT_VERSION,
+            "pass1_completed": True,
+            "pass1_model": pass1.model,
+            "pass2_model": self.settings.OPENAI_TRANSCRIPTION_MODEL,
+            "pass1_turn_count": len(pass1.segments),
+            "valid_turn_count": len(valid_turns),
+            "rejected_turn_count": len(pass1.segments) - len(valid_turns),
+            "timestamps_approximate": True,
+        }
+        try:
+            refinement = await self._refine_mono_span(
+                client,
+                SpeechChunk(
+                    track_id=track.track_id,
+                    chunk_index=0,
+                    path=track.source_path,
+                    start_seconds=0.0,
+                    end_seconds=recording_duration,
+                    audio_variant=RAW_LOSSLESS_AUDIO_VARIANT,
+                ),
+                prompt_plan=manifest.build_conversation(track.track_id),
+                context=context,
+                cancellation_check=cancellation_check,
+            )
+        except _MonoSpanRefinementCancelled as exc:
+            self._raise_mono_partial_cancellation(
+                attempts=exc.attempts,
+                usage=self._mono_usage(pass1.usage, exc.usage),
+                quality_summary={**quality, "status": "cancelled"},
+            )
+        usage = self._mono_usage(pass1.usage, refinement.usage)
+        if cancellation_check is not None and await cancellation_check():
+            self._raise_mono_partial_cancellation(
+                attempts=refinement.attempts, usage=usage,
+                quality_summary={**quality, "status": "cancelled"},
+            )
+        if not refinement.text:
+            # Preserve the current transcript if recognition fails; rough speaker
+            # detection must not silently replace a successful continuous transcript.
+            raise PartialTranscriptionError(
+                "Continuous transcription returned no usable text.",
+                attempts=refinement.attempts,
+                usage=usage,
+                quality_summary={**quality, "status": "failed"},
+            )
+        alignment = align_conversation(
+            refinement.text, valid_turns,
+            recording_duration_seconds=recording_duration,
+        )
+        hypotheses = tuple(
+            ChunkHypothesis(
+                track_id=track.track_id,
+                # All segments reference the one complete-audio attempt. They
+                # are placements of its words, not separately recognized crops.
+                chunk_index=0,
+                start_seconds=segment.start_seconds,
+                end_seconds=segment.end_seconds,
+                text=segment.text,
+                speaker_label=segment.speaker_label,
+                speaker_source=("unknown" if segment.speaker_label == "Unknown" else "openai_diarization"),
+                transcription_model=refinement.model,
+                audio_variant=refinement.audio_variant,
+                quality_flags=tuple(dict.fromkeys((
+                    *refinement.quality_flags,
+                    "approximate_timestamps",
+                    *(("speaker_alignment_uncertain", QUALITY_FLAG_HUMAN_REVIEW_RECOMMENDED)
+                      if segment.speaker_label == "Unknown" else ()),
+                ))),
+            )
+            for segment in alignment.segments
+        )
+        uncertain = alignment.uncertain_word_count > 0
+        quality.update({
+            "status": "completed_with_warning" if uncertain else "complete",
+            "warning": (
+                "Text was transcribed with the complete conversation. Speaker timing is approximate. "
+                "Some words could not be assigned to a speaker reliably."
+                if uncertain else
+                "Text was transcribed with the complete conversation. Speaker timing is approximate."
+            ),
+            "alignment_match_ratio": alignment.match_ratio,
+            "alignment_limit_exceeded": alignment.limit_exceeded,
+            "uncertain_word_count": alignment.uncertain_word_count,
+            "recognized_word_count": alignment.word_count,
+            "degraded": False,
+        })
+        duration = pass1.processing_duration_seconds + refinement.processing_duration_seconds
+        track_result = TrackTranscriptionResult(
+            track_id=track.track_id,
+            model=refinement.model or self.settings.OPENAI_TRANSCRIPTION_MODEL,
+            language="el", prompt_version=manifest.prompt_identity,
+            processing_duration_seconds=duration, hypotheses=hypotheses,
+            usage=usage, diarized=True, attempts=refinement.attempts,
+        )
+        return OrchestratedTranscriptionResult(
+            mode=plan.mode, model=track_result.model, language="el",
+            prompt_version=manifest.prompt_identity,
+            processing_duration_seconds=duration,
+            segments=hypotheses, tracks=(track_result,), usage=usage,
+            diarized=True, confidence_status="unavailable",
+            attribution_status=plan.attribution_status, plan_reason=plan.reason,
+            attempts=refinement.attempts, quality_summary=quality,
         )
 
     async def _refine_mono_span(

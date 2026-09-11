@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from dataclasses import replace
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -29,7 +30,9 @@ from app.workers.pipeline import (
     _partial_run_metadata_from_failure,
     _persist_partial_attempt_evidence,
     _persist_transcription_result,
+    _validate_transcription_attempts,
 )
+from app.services.transcription.conversation import CONVERSATION_ALIGNMENT_VERSION
 
 
 class _CapturingSession:
@@ -143,6 +146,65 @@ async def test_mono_fallback_persists_quality_and_no_selected_refinement() -> No
     assert segment.operator_id is None
     assert segment.speaker_source is SpeakerSource.OPENAI_DIARIZATION
     assert attempt.selected is False
+
+
+def _conversation_result() -> OrchestratedTranscriptionResult:
+    base = _mono_result(attempts=(_mono_attempt(selected=True),), flags=())
+    segment = replace(
+        base.segments[0], text="Recognized words.",
+        quality_flags=("approximate_timestamps",),
+        transcription_model="gpt-transcribe",
+    )
+    unknown = replace(
+        segment, text="Missing reply.", speaker_label="Unknown", speaker_source="unknown",
+        start_seconds=3.0, end_seconds=4.0,
+        quality_flags=("approximate_timestamps", "speaker_alignment_uncertain", "human_review_recommended"),
+    )
+    return replace(
+        base, model="gpt-transcribe", segments=(segment, unknown),
+        attempts=(replace(base.attempts[0], model="gpt-transcribe", response_text="Recognized words. Missing reply."),),
+        quality_summary={"strategy": CONVERSATION_ALIGNMENT_VERSION},
+    )
+
+
+@pytest.mark.asyncio
+async def test_conversation_persists_multiple_segments_against_one_audio_attempt() -> None:
+    session = _CapturingSession()
+    transcript = SimpleNamespace(id=uuid4())
+    await _persist_transcription_result(
+        session, transcript, _conversation_result(),
+        SimpleNamespace(id=uuid4()), None, None, 12.0,
+    )
+    segments = [item for item in session.added if isinstance(item, TranscriptSegment)]
+    attempts = [item for item in session.added if isinstance(item, TranscriptionAttempt)]
+    assert len(attempts) == 1
+    assert len(segments) == 2
+    assert segments[1].speaker_source is SpeakerSource.UNKNOWN
+    assert segments[1].operator_id is None
+    assert transcript.original_text == attempts[0].response_text
+
+
+@pytest.mark.parametrize("mutation", ["text", "missing", "identity", "operator", "source", "timestamps", "bounds"])
+def test_conversation_rejects_changed_text_or_unsupported_attribution(mutation: str) -> None:
+    result = _conversation_result()
+    first, second = result.segments
+    if mutation == "text":
+        first = replace(first, text="Invented words.")
+    elif mutation == "missing":
+        result = replace(result, attempts=())
+    elif mutation == "identity":
+        first = replace(first, chunk_index=10)
+    elif mutation == "operator":
+        first = replace(first, operator_id=str(uuid4()))
+    elif mutation == "source":
+        second = replace(second, speaker_label="B")
+    elif mutation == "timestamps":
+        first = replace(first, quality_flags=())
+    elif mutation == "bounds":
+        first = replace(first, end_seconds=100)
+    result = replace(result, segments=(first, second))
+    with pytest.raises(ValueError):
+        _validate_transcription_attempts(result)
 
 
 @pytest.mark.asyncio

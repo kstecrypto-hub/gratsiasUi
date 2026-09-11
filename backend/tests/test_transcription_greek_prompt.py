@@ -446,6 +446,7 @@ def test_mono_prompt_uses_anonymous_role_and_bounded_global_context() -> None:
     assert "discard-prefix" not in prompt.text
     assert "Shared Company" in prompt.text
     assert "Selected Operator" not in prompt.text
+    assert "Selected Operator" not in prompt.keywords
     assert prompt.previous_context_characters <= MAX_PREVIOUS_CONTEXT_CHARACTERS
 
 
@@ -470,3 +471,29 @@ def test_v2_prompt_builder_rejects_legacy_mode() -> None:
 
     with pytest.raises(ValueError, match="standard transcription"):
         V2GreekPromptBuilder().build_manifest(plan, ())
+
+
+def test_conversation_prompt_uses_vocabulary_without_single_speaker_context() -> None:
+    manifest = V2GreekPromptBuilder().build_manifest(
+        _mono_plan(), (_term("Sample Company", PRIORITY_COMPANY, VOCABULARY_SOURCE_COMPANY),),
+    )
+    prompt = manifest.build_conversation("mono-diarization")
+    assert "Sample Company" in prompt.text
+    assert prompt.keywords == ("Sample Company",)
+    assert "όλους τους ομιλητές" in prompt.text
+    assert "Τρέχων ανώνυμος ομιλητής" not in prompt.text
+    assert "Γνωστός ρόλος καναλιού" not in prompt.text
+    assert prompt.previous_context_characters == 0
+    assert prompt.prompt_hash != manifest.build_anonymous("mono-diarization", "A").prompt_hash
+
+
+def test_keyword_hints_cannot_bypass_vocabulary_filtering_and_limits() -> None:
+    terms = tuple(_term(f"Term {index}", PRIORITY_COMPANY, VOCABULARY_SOURCE_COMPANY) for index in range(80))
+    terms += (
+        _term("password=secret-value", 100, VOCABULARY_SOURCE_COMPANY),
+        _term("123456789", 100, VOCABULARY_SOURCE_COMPANY),
+    )
+    prompt = V2GreekPromptBuilder().build_manifest(_mono_plan(), terms).build_conversation("mono-diarization")
+    assert len(prompt.keywords) == 64
+    assert all(term.startswith("Term ") for term in prompt.keywords)
+    assert "secret-value" not in repr(prompt)

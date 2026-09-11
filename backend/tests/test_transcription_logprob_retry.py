@@ -116,8 +116,9 @@ def _request_without_file(request: Mapping[str, Any]) -> dict[str, Any]:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("request_logprobs", [False, True])
+@pytest.mark.parametrize("keywords", [(), ("Example Company", "service")])
 async def test_gpt_transcribe_uses_plural_languages_without_fabricated_confidence(
-    tmp_path: Path, request_logprobs: bool,
+    tmp_path: Path, request_logprobs: bool, keywords: tuple[str, ...],
 ) -> None:
     provider = _ProviderClient({
         "text": "Το αυτοκίνητο έχει επισκευαστεί.",
@@ -130,13 +131,13 @@ async def test_gpt_transcribe_uses_plural_languages_without_fabricated_confidenc
     )
     result = await client.transcribe_isolated(
         [_audio_chunk(tmp_path)], [], language="el",
-        prompt_plan=_prompt_plan(), request_logprobs=request_logprobs,
+        prompt_plan=replace(_prompt_plan(), keywords=keywords), request_logprobs=request_logprobs,
     )
     assert _request_without_file(provider.requests[0]) == {
         "model": "gpt-transcribe",
         "prompt": "Ελληνικό τηλεφωνικό αίτημα",
         "response_format": "json",
-        "extra_body": {"languages": ["el"]},
+        "extra_body": {"languages": ["el"], **({"keywords": list(keywords)} if keywords else {})},
     }
     assert provider.with_options_calls == ([{"max_retries": 0}] if request_logprobs else [])
     assert result.text == "Το αυτοκίνητο έχει επισκευαστεί."

@@ -19,6 +19,7 @@ from app.services.transcription.client import (
 )
 from app.services.transcription.mono import MonoRefinementPolicy
 from app.services.transcription.orchestrator import (
+    PartialTranscriptionError,
     PartialTranscriptionCancelledError,
     TranscriptionContext,
     TranscriptionOrchestrator,
@@ -131,9 +132,12 @@ class MonoClient:
         self,
         pass1_segments: list[TranscribedSegment],
         pass2_scripts: list[StandardScript | Exception],
+        *,
+        model: str = "gpt-4o-transcribe",
     ) -> None:
         self.pass1_segments = pass1_segments
         self.pass2_scripts = iter(pass2_scripts)
+        self.model = model
         self.pass1_requests: list[AudioChunk] = []
         self.pass2_requests: list[tuple[AudioChunk, PromptPlan]] = []
 
@@ -198,7 +202,7 @@ class MonoClient:
             logprobs_available=script.logprobs_available,
         )
         return TranscriptionResult(
-            model="gpt-4o-transcribe",
+            model=self.model,
             language="el",
             prompt_version=prompt_plan.version,
             processing_duration_seconds=0.1,
@@ -245,6 +249,84 @@ def _context(tmp_path: Path) -> TranscriptionContext:
         vocabulary=(),
         temporary_directory=tmp_path / "temporary",
     )
+
+
+@pytest.mark.asyncio
+async def test_gpt_transcribe_recognizes_complete_conversation_once(tmp_path: Path) -> None:
+    from app.workers.pipeline import _validate_transcription_attempts
+
+    text = "Ναι, δεν ξέρω. Είναι μέσα στο service. Εντάξει, ευχαριστώ."
+    client = MonoClient(
+        [TranscribedSegment(1, 3, "Ναι δεν ξέρω", "A"),
+         TranscribedSegment(3, 3.1, "δεν ξέρω", "B"),
+         TranscribedSegment(3.1, 3.3, "δεν ξέρω", "A"),
+         TranscribedSegment(3.3, 6, "Είναι μέσα στο service", "B")],
+        [StandardScript(text, (), False)], model="gpt-transcribe",
+    )
+    processor = MonoAudioProcessor()
+    orchestrator = _orchestrator(tmp_path, client, processor)
+    orchestrator.settings = orchestrator.settings.model_copy(update={"OPENAI_TRANSCRIPTION_MODEL": "gpt-transcribe"})
+    result = await orchestrator.transcribe(
+        source_path=tmp_path / "source.wav", audio_info=_audio_info(),
+        context=_context(tmp_path), plan=_plan(tmp_path),
+    )
+    assert result.text == text
+    assert result.model == "gpt-transcribe"
+    assert processor.extracted_ranges == []
+    assert len(client.pass2_requests) == 1
+    chunk, prompt = client.pass2_requests[0]
+    assert (chunk.start_seconds, chunk.end_seconds) == (0, 60)
+    assert prompt.previous_context_characters == 0
+    assert "όλους τους ομιλητές" in prompt.text
+    assert len(result.attempts) == 1
+    assert result.attempts[0].response_text == text
+    assert result.segments[-1].speaker_source == "unknown"
+    assert all(segment.operator_id is None for segment in result.segments)
+    assert result.confidence_status == "unavailable"
+    assert result.quality_summary["timestamps_approximate"] is True
+    _validate_transcription_attempts(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("script", [StandardScript("", (), False), RuntimeError("provider failure")])
+async def test_continuous_failure_preserves_paid_history_and_does_not_publish_rough_text(
+    tmp_path: Path, script: StandardScript | Exception,
+) -> None:
+    client = MonoClient([TranscribedSegment(1, 3, "rough text", "A")], [script])
+    orchestrator = _orchestrator(tmp_path, client, MonoAudioProcessor())
+    orchestrator.settings = orchestrator.settings.model_copy(update={"OPENAI_TRANSCRIPTION_MODEL": "gpt-transcribe"})
+    with pytest.raises(PartialTranscriptionError) as caught:
+        await orchestrator.transcribe(
+            source_path=tmp_path / "source.wav", audio_info=_audio_info(),
+            context=_context(tmp_path), plan=_plan(tmp_path),
+        )
+    assert caught.value.quality_summary["pass1_completed"] is True
+    assert caught.value.quality_summary["status"] == "failed"
+    assert caught.value.usage["pass1_diarization"]["totals"]["input_tokens"] == 11
+    assert not any(attempt.selected for attempt in caught.value.attempts)
+
+
+@pytest.mark.asyncio
+async def test_continuous_cancellation_after_recognition_retains_attempt(tmp_path: Path) -> None:
+    client = MonoClient(
+        [TranscribedSegment(1, 3, "Ναι", "A")],
+        [StandardScript("Ναι.", (), False)], model="gpt-transcribe",
+    )
+    orchestrator = _orchestrator(tmp_path, client, MonoAudioProcessor())
+    orchestrator.settings = orchestrator.settings.model_copy(update={"OPENAI_TRANSCRIPTION_MODEL": "gpt-transcribe"})
+
+    async def cancel_after_recognition() -> bool:
+        return bool(client.pass2_requests)
+
+    with pytest.raises(PartialTranscriptionCancelledError) as caught:
+        await orchestrator.transcribe(
+            source_path=tmp_path / "source.wav", audio_info=_audio_info(),
+            context=_context(tmp_path), plan=_plan(tmp_path),
+            cancellation_check=cancel_after_recognition,
+        )
+    assert len(caught.value.attempts) == 1
+    assert caught.value.quality_summary["status"] == "cancelled"
+    assert caught.value.usage["pass2_refinement"]["totals"]["input_tokens"] == 3
 
 
 @pytest.mark.asyncio

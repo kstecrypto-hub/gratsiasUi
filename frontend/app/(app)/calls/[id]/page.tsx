@@ -100,6 +100,8 @@ export default function CallDetailPage() {
   );
   const needsReview = (call?.confidence_status && call.confidence_status !== "unavailable") ||
     Boolean(call?.transcript_segments?.some((segment) => segment.quality_flags?.length));
+  const approximateTimes = call?.transcript_segments?.some((segment) =>
+    segment.quality_flags?.includes("approximate_timestamps"));
 
   async function assignChannel(channel: 0 | 1) {
     if (!call?.transcript_id || !assignmentOperatorId) {
@@ -246,6 +248,7 @@ export default function CallDetailPage() {
           </div>
         ) : null}
         <div className="section-header"><div><h2 id="transcript-title">Transcript</h2><p>Speaker labels reflect the available call and audio evidence. Unknown speakers remain marked as unknown.</p>{needsReview ? <span className="notice" role="status">Needs review</span> : null}</div></div>
+        {approximateTimes ? <p className="muted">This transcript uses the complete conversation. Speaker timestamps are approximate; words with uncertain speaker attribution are marked Unknown.</p> : null}
         {segments.length ? <div className="transcript">{segments.map((segment) => <TranscriptRow key={String(segment.id)} segment={segment} matches={matches} onSeek={seek} />)}</div> : <div className="empty-state"><h2>No transcript is available</h2><p className="muted">The recording may not have been transcribed, or processing may still be underway.</p></div>}
       </section>
 

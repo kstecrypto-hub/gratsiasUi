@@ -269,18 +269,25 @@ TRANSCRIPTION_LANGUAGE=el
 ```
 
 Recreate the backend and worker with the same Compose project and files used to
-launch your installation. V2 first identifies speaker turns in mono recordings,
-then transcribes their audio with Greek instructions, configured company terms,
-and preceding conversation context. Confirmed stereo tracks are transcribed
-separately. Mono crops retain extra audio at pauses to avoid clipping final
-syllables; the extra padding is capped before the next speaker turn and the
-original timestamps are retained. Add accurately spelled company and service terms in **Settings →
-Company vocabulary** to help with names and specialist terminology.
+launch your installation. With `gpt-transcribe`, V2 recognizes the complete mono
+conversation in one pass with Greek instructions and configured company terms.
+Separate diarization evidence places those words against anonymous speakers.
+This avoids clipping words or repeatedly recognizing a padded interruption.
+Alignment preserves every recognized word, including genuine repetitions;
+uncertain speaker assignments remain **Unknown**. Times are approximate, and
+text-alignment scores are not recognition confidence. A failed recognition pass
+keeps the previous current transcript. Confirmed stereo tracks are transcribed
+separately. Add accurately spelled company and service terms in **Settings →
+Company vocabulary** to help with names and specialist terminology. These hints
+do not replace unclear audio with a guessed script.
 
-The GPT Transcribe adapter uses the model's plural `languages` hints. It does
+The GPT Transcribe adapter uses the model's plural `languages` hints and sends
+up to 64 ranked, sanitized vocabulary terms as explicit `keywords` spelling hints.
+It does
 not request or invent token confidence scores, which this model does not expose.
 `gpt-4o-transcribe` remains supported for deployments requiring token confidence
-and the corresponding low-confidence audio-normalization retry. Model request
+and the corresponding low-confidence audio-normalization retry. That model keeps
+the existing per-turn mono refinement with pause padding. Model request
 contracts follow the official [file transcription guide](https://developers.openai.com/api/docs/guides/speech-to-text).
 
 Completed transcripts are reused during ordinary analysis. To replace one,
