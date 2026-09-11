@@ -2,15 +2,15 @@
 
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
-import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { CallMetadata } from "@/components/call-metadata";
 import { RecordingPlayer, useRecordingPlayer } from "@/components/recording-player";
-import { SpeakerLabel } from "@/components/speaker-label";
+import { CallTranscript, segmentNeedsReview } from "@/components/call-transcript";
 import { ErrorState, LoadingState, TableEmpty } from "@/components/page-state";
 import { StatusLabel } from "@/components/status-label";
 import { api, messageFromError } from "@/lib/api";
 import { formatDateTime, formatDuration, formatTimestamp, titleCase } from "@/lib/format";
-import type { CallDetail, KeywordMatch, TranscriptSegment } from "@/lib/types";
+import type { CallDetail } from "@/lib/types";
 
 export default function CallDetailPage() {
   const params = useParams<{ id: string }>();
@@ -28,6 +28,8 @@ export default function CallDetailPage() {
   const [assignmentOperatorId, setAssignmentOperatorId] = useState("");
   const [assignmentDismissed, setAssignmentDismissed] = useState(false);
   const [resultsHref, setResultsHref] = useState("/results");
+  const [position, setPosition] = useState(0);
+  const [audioPlayable, setAudioPlayable] = useState(true);
 
   const load = useCallback(async () => {
     setError("");
@@ -67,6 +69,7 @@ export default function CallDetailPage() {
     if (assignmentOperators.length === 0) setAssignmentOperatorId("");
   }, [assignmentOperators, assignmentOperatorId]);
   useEffect(() => { setAssignmentDismissed(false); }, [call?.id]);
+  useEffect(() => { setAudioPlayable(true); setPosition(0); }, [id]);
 
   async function retry() {
     setRetrying(true);
@@ -98,10 +101,9 @@ export default function CallDetailPage() {
   const assignmentAvailable = call?.transcription_mode === "dual_channel" && (
     call?.speaker_assignment_required === true || call?.speaker_attribution_status === "manually_assigned"
   );
-  const needsReview = (call?.confidence_status && call.confidence_status !== "unavailable") ||
-    Boolean(call?.transcript_segments?.some((segment) => segment.quality_flags?.length));
-  const approximateTimes = call?.transcript_segments?.some((segment) =>
-    segment.quality_flags?.includes("approximate_timestamps"));
+  const reviewCount = segments.filter(segmentNeedsReview).length;
+  const wordingReview = call?.transcript_quality_summaries?.length === 1
+    ? call.transcript_quality_summaries[0].quality_summary?.wording_review : undefined;
 
   async function assignChannel(channel: 0 | 1) {
     if (!call?.transcript_id || !assignmentOperatorId) {
@@ -136,30 +138,41 @@ export default function CallDetailPage() {
   }
 
   const hasAudio = call.audio_available === true || call.recording_available === true;
+  const canSeek = hasAudio && audioPlayable;
+  const processingStatus = call.processing_status || call.status;
   const canRetry = ["failed", "completed_with_errors"].includes(call.processing_status || call.status || "");
   const operatorName = call.operator?.display_name || call.operator_name || "—";
 
   return (
-    <>
-      <div className="page-intro">
-        <div><h2>{formatDateTime(call.occurred_at || call.started_at)}</h2><p>{operatorName}</p></div>
-        <div className="page-actions">{canRetry ? <button className="button secondary" type="button" disabled={retrying || reprocessing} onClick={() => void retry()}>{retrying ? "Retrying…" : "Retry processing"}</button> : null}<Link className="button secondary" href={resultsHref}>Back to results</Link></div>
+    <div className="call-workspace">
+      <Link className="call-back" href={resultsHref}>← Back to results</Link>
+      <div className="call-intro">
+        <div><span className="eyebrow">{titleCase(call.direction)} CALL · {formatDuration(call.duration_seconds)}</span>
+          <h2>{operatorName === "—" ? "Call conversation" : operatorName}</h2><p>{formatDateTime(call.occurred_at || call.started_at)}</p></div>
+        <StatusLabel status={processingStatus === "completed_speaker_attribution_unknown" ? "completed" : processingStatus} />
       </div>
+      <div className="call-parties"><span><small>FROM</small> {call.caller || "Unknown caller"}</span><span aria-hidden="true">→</span><span><small>TO</small> {call.callee || "Unknown callee"}</span>
+        {call.queue ? <span className="call-queue">{call.queue}</span> : null}</div>
       {actionError ? <div className="form-error" role="alert">{actionError}</div> : null}
 
-      <section className="section" aria-labelledby="call-info-title">
-        <div className="section-header"><div><h2 id="call-info-title">Call information</h2></div><StatusLabel status={call.processing_status || call.status} /></div>
-        <CallMetadata items={[
-          { label: "Date and time", value: formatDateTime(call.occurred_at || call.started_at) },
-          { label: "Operator", value: operatorName },
-          { label: "Caller", value: call.caller || "—" },
-          { label: "Callee", value: call.callee || "—" },
-          { label: "Duration", value: formatDuration(call.duration_seconds) },
-          { label: "Direction", value: titleCase(call.direction) },
-          { label: "Queue", value: call.queue || "—" },
-          { label: "Detected phrases", value: matches.length },
-        ]} />
+      <section className="call-recording" aria-labelledby="recording-title">
+        <div className="recording-heading"><h2 id="recording-title">Recording</h2><span>{hasAudio ? "Original audio · Listen and review" : "Audio unavailable"}</span></div>
+        {hasAudio ? <RecordingPlayer key={id} audioRef={audioRef} src={api.calls.audioUrl(id)} onPositionChange={setPosition} onAvailabilityChange={setAudioPlayable}
+          errorMessage="The recording could not be played. Try refreshing; it may have been removed from the phone system." /> : <p className="muted">No recording is available for this call.</p>}
       </section>
+
+      <div className="call-review-summary">
+        <div><strong>{reviewCount ? "A closer listen is needed" : "Ready to read"}</strong>
+          <p>{reviewCount ? "Check highlighted wording and unclear speaker changes below." : "Read the conversation or select a timestamp to listen."}</p></div>
+        <div className="page-actions">
+          {canRetry ? <button className="button secondary compact" type="button" disabled={retrying || reprocessing} onClick={() => void retry()}>{retrying ? "Retrying…" : "Retry processing"}</button> : null}
+          {transcriptionV2Enabled && call.transcript_id ? <button className="button secondary compact" type="button" disabled={reprocessing || retrying} onClick={() => void reprocess()}>{reprocessing ? "Queuing…" : "Retranscribe audio"}</button> : null}
+        </div>
+        {transcriptionV2Enabled && call.transcript_id ? <small>A new transcription checks the wording again. Transcription charges apply; previous versions are kept.</small> : null}
+      </div>
+
+      <CallTranscript key={String(call.transcript_id || id)} segments={segments} matches={matches} reviews={wordingReview?.items || []}
+        verificationStatus={wordingReview?.status} truncated={wordingReview?.truncated} position={position} canSeek={canSeek} onSeek={seek} />
 
       {assignmentAvailable && !assignmentDismissed ? (
         <section className="section" aria-labelledby="speaker-assignment-title">
@@ -225,53 +238,33 @@ export default function CallDetailPage() {
         </section>
       ) : null}
 
-      <section className="section" aria-labelledby="recording-title">
-        <div className="section-header"><div><h2 id="recording-title">Recording</h2><p>Use a detected phrase timestamp to jump to that moment.</p></div></div>
-        {hasAudio ? <RecordingPlayer key={id} audioRef={audioRef} src={api.calls.audioUrl(id)} errorMessage="The recording could not be played. Your session may have expired or the audio may have been removed according to the retention settings." /> : <div className="notice" role="status">No recording is available for this call.</div>}
-      </section>
-
-      <section className="section" aria-labelledby="matches-title">
-        <div className="section-header"><div><h2 id="matches-title">Detected phrases</h2><p>Phrase searches normally use attributed operator speech. If all speakers were explicitly included, unattributed speech remains marked as unknown below.</p></div></div>
+      <details className="call-disclosure" open={matches.length > 0}>
+        <summary>Detected phrases <span>{matches.length}</span></summary>
         <div className="table-wrap">
           <table>
             <thead><tr><th scope="col">Time</th><th scope="col">Category</th><th scope="col">Phrase</th><th scope="col">Transcript context</th><th scope="col">Method</th></tr></thead>
-            <tbody>{matches.length ? matches.map((match) => <tr key={String(match.id)}><td><button type="button" className="button secondary compact match-time" onClick={() => seek(match.start_timestamp)} disabled={!hasAudio} aria-label={`Play recording from ${formatTimestamp(match.start_timestamp)}`}>{formatTimestamp(match.start_timestamp)}</button></td><td>{match.category_name || match.category || "—"}</td><td>{match.keyword_phrase || match.keyword || match.original_matched_text || "—"}</td><td>{[match.context_before, match.original_matched_text, match.context_after].filter(Boolean).join(" ") || "—"}</td><td>{titleCase(match.match_method)}</td></tr>) : <TableEmpty colSpan={5}>No phrases were detected for this call.</TableEmpty>}</tbody>
+            <tbody>{matches.length ? matches.map((match) => <tr key={String(match.id)}><td><button type="button" className="button secondary compact match-time" onClick={() => seek(match.start_timestamp)} disabled={!canSeek} aria-label={`Play recording from ${formatTimestamp(match.start_timestamp)}`}>{formatTimestamp(match.start_timestamp)}</button></td><td>{match.category_name || match.category || "—"}</td><td>{match.keyword_phrase || match.keyword || match.original_matched_text || "—"}</td><td>{[match.context_before, match.original_matched_text, match.context_after].filter(Boolean).join(" ") || "—"}</td><td>{titleCase(match.match_method)}</td></tr>) : <TableEmpty colSpan={5}>No phrases were detected for this call.</TableEmpty>}</tbody>
           </table>
         </div>
-      </section>
+      </details>
 
-      <section className="section" aria-labelledby="transcript-title">
-        {transcriptionV2Enabled && call.transcript_id ? (
-          <div className="section-header">
-            <div><p>Transcribe the audio again with Greek vocabulary and a second pass for mixed-speaker recordings. Transcription charges apply, and the previous version stays in history.</p></div>
-            <button className="button secondary" type="button" disabled={reprocessing || retrying} onClick={() => void reprocess()}>{reprocessing ? "Queuing…" : "Retranscribe audio"}</button>
-          </div>
-        ) : null}
-        <div className="section-header"><div><h2 id="transcript-title">Transcript</h2><p>Speaker labels reflect the available call and audio evidence. Unknown speakers remain marked as unknown.</p>{needsReview ? <span className="notice" role="status">Needs review</span> : null}</div></div>
-        {approximateTimes ? <p className="muted">This transcript uses the complete conversation. Speaker timestamps are approximate; words with uncertain speaker attribution are marked Unknown.</p> : null}
-        {segments.length ? <div className="transcript">{segments.map((segment) => <TranscriptRow key={String(segment.id)} segment={segment} matches={matches} onSeek={seek} />)}</div> : <div className="empty-state"><h2>No transcript is available</h2><p className="muted">The recording may not have been transcribed, or processing may still be underway.</p></div>}
-      </section>
-
-      <section className="section" aria-labelledby="history-title">
-        <div className="section-header"><div><h2 id="history-title">Processing history</h2><p>A plain-language record of processing steps for this call.</p></div></div>
+      <details className="call-disclosure">
+        <summary>Call details</summary>
+        <CallMetadata items={[
+          { label: "Date and time", value: formatDateTime(call.occurred_at || call.started_at) },
+          { label: "Operator", value: operatorName },
+          { label: "Duration", value: formatDuration(call.duration_seconds) },
+          { label: "Direction", value: titleCase(call.direction) },
+          { label: "Queue", value: call.queue || "—" },
+          { label: "Detected phrases", value: matches.length },
+        ]} />
+      </details>
+      <details className="call-disclosure">
+        <summary>Processing history <span>{call.processing_history?.length || 0}</span></summary>
         <div className="table-wrap">
           <table><thead><tr><th scope="col">Time</th><th scope="col">Status</th><th scope="col">Details</th></tr></thead><tbody>{call.processing_history?.length ? call.processing_history.map((entry, index) => <tr key={String(entry.id ?? index)}><td>{formatDateTime(entry.occurred_at || entry.created_at)}</td><td><StatusLabel status={entry.status} /></td><td>{entry.message || "—"}</td></tr>) : <TableEmpty colSpan={3}>No processing history is available.</TableEmpty>}</tbody></table>
         </div>
-      </section>
-    </>
+      </details>
+    </div>
   );
-}
-
-function TranscriptRow({ segment, matches, onSeek }: { segment: TranscriptSegment; matches: KeywordMatch[]; onSeek: (seconds: number) => void }) {
-  const segmentMatches = matches.filter((match) => String(match.transcript_segment_id) === String(segment.id));
-  const terms = segmentMatches.map((match) => match.original_matched_text || match.keyword_phrase || match.keyword || "").filter(Boolean);
-  return <div className="transcript-segment"><SpeakerLabel label={segment.speaker_label} source={segment.speaker_source} timestamp={segment.start_timestamp} onSeek={onSeek} /><p className="transcript-text">{highlight(segment.original_text, terms)}</p></div>;
-}
-
-function highlight(text: string, terms: string[]) {
-  const unique = Array.from(new Set(terms.map((term) => term.trim()).filter(Boolean))).sort((a, b) => b.length - a.length);
-  if (!unique.length) return text;
-  const escaped = unique.map((term) => term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
-  const expression = new RegExp(`(${escaped.join("|")})`, "giu");
-  return text.split(expression).map((part, index) => unique.some((term) => term.toLocaleLowerCase("el-GR") === part.toLocaleLowerCase("el-GR")) ? <mark key={`${part}-${index}`}>{part}</mark> : <Fragment key={`${part}-${index}`}>{part}</Fragment>);
 }

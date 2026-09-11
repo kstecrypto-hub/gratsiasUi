@@ -273,6 +273,12 @@ launch your installation. With `gpt-transcribe`, V2 recognizes the complete mono
 conversation in one pass with Greek instructions and configured company terms.
 Separate diarization evidence places those words against anonymous speakers.
 This avoids clipping words or repeatedly recognizing a padded interruption.
+For this mono path, a second full-audio reading uses light telephone-audio
+normalization to locate disputed wording. Both attempts and their usage are kept;
+only one is selected, and disagreements never automatically rewrite the selected
+text. This uses up to two standard transcription uploads plus diarization. If
+the second reading is unavailable, the primary transcript remains usable and the
+missing wording check is disclosed.
 Alignment preserves every recognized word, including genuine repetitions;
 uncertain speaker assignments remain **Unknown**. Times are approximate, and
 text-alignment scores are not recognition confidence. A failed recognition pass
@@ -296,6 +302,14 @@ This creates an API-billed V2 job, downloads the original recording again if
 needed, and retains the prior transcript in history. The replacement becomes
 current only after processing succeeds. Audio already removed from the PBX
 cannot be recovered by changing models.
+
+The call screen puts recording playback and the transcript first. It groups
+adjacent turns from the same speaker, follows playback, and supports accent-insensitive
+Greek search, copying the original text, and filtering passages needing review.
+**Compare wording** shows disputed readings with a contextual listening shortcut.
+Missing logprobs and approximate timestamps alone do not mark a passage as an error.
+Production review is read-only; human evaluation references remain separate in
+the existing `/evaluation` section.
 
 ## 7. Database migrations
 

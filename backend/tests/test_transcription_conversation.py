@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import pytest
 
-from app.services.transcription.conversation import align_conversation
+from app.services.transcription.conversation import (
+    ConversationSegment, align_conversation, review_conversation_wording,
+)
 from app.services.transcription.mono import AnonymousDiarizationTurn
 
 
@@ -124,3 +126,30 @@ def test_insertion_within_one_turn_does_not_split_speaker_or_duplicate_text() ->
     assert len(result.segments) == 1
     assert result.segments[0].text == text
     assert result.segments[0].speaker_label == "A"
+
+
+def test_wording_review_preserves_readings_and_locates_insertions_and_numbers() -> None:
+    segments = (
+        ConversationSegment("Γεια σας.", 1, 3, "A"),
+        ConversationSegment("Η πινακίδα είναι 4179.", 5, 8, "B"),
+    )
+    review = review_conversation_wording(segments, "Ναι. Γεια σας. Η πινακίδα είναι 4189. Ευχαριστώ.")
+    assert review["difference_count"] == 2
+    assert review["items"][0]["segment_indexes"] == [0]
+    assert review["items"][0]["original_text"] == ""
+    assert review["items"][1]["segment_indexes"] == [1]
+    assert review["items"][1]["start_seconds"] == 5
+    assert review["items"][1]["original_text"] == "4179."
+    assert review["items"][1]["alternative_text"] == "4189. Ευχαριστώ."
+
+
+@pytest.mark.parametrize("alternative", ["γεια σας", "Γεια σας!", "ΓΕΙΑ ΣΑΣ."])
+def test_wording_review_ignores_case_and_punctuation(alternative: str) -> None:
+    review = review_conversation_wording((ConversationSegment("Γεια σας.", 0, 2, "A"),), alternative)
+    assert review["status"] == "complete"
+    assert review["items"] == []
+
+
+def test_wording_review_is_unavailable_without_a_second_reading() -> None:
+    review = review_conversation_wording((ConversationSegment("Speech", 0, 2, "A"),), "")
+    assert review["status"] == "unavailable"

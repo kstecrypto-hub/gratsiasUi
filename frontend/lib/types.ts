@@ -410,6 +410,17 @@ export type CallDetail = {
   available_channels?: number[];
   confidence_status?: string | null;
   pipeline_version?: string | null;
+  transcript_quality_summaries?: Array<{
+    transcript_id: Identifier;
+    quality_summary?: {
+      wording_review?: {
+        status: string;
+        difference_count?: number;
+        truncated?: boolean;
+        items: WordingReview[];
+      };
+    } | null;
+  }>;
   participants?: Array<{
     operator_id?: Identifier | null;
     operator_name?: string | null;
@@ -422,6 +433,14 @@ export type CallDetail = {
   matches?: KeywordMatch[];
   transcript_segments?: TranscriptSegment[];
   processing_history?: ProcessingHistoryEntry[];
+};
+
+export type WordingReview = {
+  segment_indexes: number[];
+  start_seconds: number;
+  end_seconds: number;
+  original_text: string;
+  alternative_text: string;
 };
 
 export type SpeakerAssignmentInput = {

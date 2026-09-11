@@ -14,7 +14,8 @@ import unicodedata
 from app.services.transcription.mono import AnonymousDiarizationTurn
 
 
-CONVERSATION_ALIGNMENT_VERSION = "mono-continuous-alignment-v1"
+CONVERSATION_ALIGNMENT_VERSION = "mono-continuous-alignment-v2"
+WORDING_REVIEW_VERSION = "raw-normalized-wording-review-v1"
 MIN_RELIABLE_TURN_SECONDS = 0.35
 SHORT_TURN_SECONDS = 1.0
 MIN_SHORT_TURN_MATCH_RATIO = 0.6
@@ -37,6 +38,48 @@ class ConversationAlignment:
     uncertain_word_count: int
     word_count: int
     limit_exceeded: bool = False
+
+
+def review_conversation_wording(
+    segments: tuple[ConversationSegment, ...], alternative_text: str,
+) -> dict[str, object]:
+    """Locate disagreements, without choosing a spelling or inventing confidence."""
+
+    words: list[str] = []
+    owners: list[int] = []
+    for index, segment in enumerate(segments):
+        tokens = segment.text.split()
+        words.extend(tokens)
+        owners.extend([index] * len(tokens))
+    alternative = alternative_text.split()
+    if not words or not alternative:
+        return {"version": WORDING_REVIEW_VERSION, "status": "unavailable", "items": []}
+    if len(words) * len(alternative) > MAX_ALIGNMENT_TOKEN_PRODUCT:
+        return {"version": WORDING_REVIEW_VERSION, "status": "limit_exceeded", "items": []}
+    opcodes = SequenceMatcher(
+        None, [_key(word) for word in words], [_key(word) for word in alternative],
+        autojunk=False,
+    ).get_opcodes()
+    items: list[dict[str, object]] = []
+    for operation, a1, a2, b1, b2 in opcodes:
+        if operation == "equal":
+            continue
+        first = owners[min(a1, len(owners) - 1)]
+        last = owners[max(a1, a2 - 1)] if a1 < len(owners) else first
+        items.append({
+            "segment_indexes": list(range(first, last + 1)),
+            "start_seconds": segments[first].start_seconds,
+            "end_seconds": max(segment.end_seconds for segment in segments[first:last + 1]),
+            "original_text": " ".join(words[a1:a2]),
+            "alternative_text": " ".join(alternative[b1:b2]),
+        })
+    return {
+        "version": WORDING_REVIEW_VERSION,
+        "status": "complete",
+        "difference_count": len(items),
+        "truncated": len(items) > 32,
+        "items": items[:32],
+    }
 
 
 def _key(word: str) -> str:

@@ -44,6 +44,7 @@ from app.services.transcription.merge import merge_track_results
 from app.services.transcription.conversation import (
     CONVERSATION_ALIGNMENT_VERSION,
     align_conversation,
+    review_conversation_wording,
 )
 from app.services.transcription.mono import (
     DEFAULT_MONO_REFINEMENT_POLICY,
@@ -765,6 +766,7 @@ class TranscriptionOrchestrator:
                 prompt_plan=manifest.build_conversation(track.track_id),
                 context=context,
                 cancellation_check=cancellation_check,
+                verify_wording=True,
             )
         except _MonoSpanRefinementCancelled as exc:
             self._raise_mono_partial_cancellation(
@@ -791,6 +793,14 @@ class TranscriptionOrchestrator:
             refinement.text, valid_turns,
             recording_duration_seconds=recording_duration,
         )
+        alternative = next((
+            attempt.response_text for attempt in refinement.attempts
+            if not attempt.selected and attempt.response_text and attempt.response_text.strip()
+        ), "")
+        wording_review = review_conversation_wording(alignment.segments, alternative)
+        disputed_indexes = {
+            index for item in wording_review["items"] for index in item["segment_indexes"]
+        }
         hypotheses = tuple(
             ChunkHypothesis(
                 track_id=track.track_id,
@@ -809,23 +819,26 @@ class TranscriptionOrchestrator:
                     "approximate_timestamps",
                     *(("speaker_alignment_uncertain", QUALITY_FLAG_HUMAN_REVIEW_RECOMMENDED)
                       if segment.speaker_label == "Unknown" else ()),
+                    *(("transcription_disagreement", QUALITY_FLAG_HUMAN_REVIEW_RECOMMENDED)
+                      if index in disputed_indexes else ()),
                 ))),
             )
-            for segment in alignment.segments
+            for index, segment in enumerate(alignment.segments)
         )
-        uncertain = alignment.uncertain_word_count > 0
+        uncertain = alignment.uncertain_word_count > 0 or bool(disputed_indexes)
         quality.update({
             "status": "completed_with_warning" if uncertain else "complete",
-            "warning": (
-                "Text was transcribed with the complete conversation. Speaker timing is approximate. "
-                "Some words could not be assigned to a speaker reliably."
-                if uncertain else
-                "Text was transcribed with the complete conversation. Speaker timing is approximate."
-            ),
+            "warning": " ".join(filter(None, (
+                "Speaker timing is approximate.",
+                "Some words have uncertain speaker attribution." if alignment.uncertain_word_count else None,
+                "The two audio readings disagree on some wording." if disputed_indexes else None,
+                "The second wording check was unavailable." if wording_review["status"] != "complete" else None,
+            ))),
             "alignment_match_ratio": alignment.match_ratio,
             "alignment_limit_exceeded": alignment.limit_exceeded,
             "uncertain_word_count": alignment.uncertain_word_count,
             "recognized_word_count": alignment.word_count,
+            "wording_review": wording_review,
             "degraded": False,
         })
         duration = pass1.processing_duration_seconds + refinement.processing_duration_seconds
@@ -854,6 +867,7 @@ class TranscriptionOrchestrator:
         prompt_plan: PromptPlan,
         context: TranscriptionContext,
         cancellation_check: Callable[[], Awaitable[bool]] | None,
+        verify_wording: bool = False,
     ) -> _MonoSpanRefinement:
         usage: dict[str, object] = {"chunks": [], "totals": {}}
         processing_duration = 0.0
@@ -895,7 +909,7 @@ class TranscriptionOrchestrator:
         normalized_retry_failed = False
         if (
             self.confidence_policy.max_attempts_per_chunk > 1
-            and is_low_confidence(raw_attempt.metrics, self.confidence_policy)
+            and (verify_wording or is_low_confidence(raw_attempt.metrics, self.confidence_policy))
         ):
             if cancellation_check is not None and await cancellation_check():
                 raise self._mono_cancelled_after_raw(

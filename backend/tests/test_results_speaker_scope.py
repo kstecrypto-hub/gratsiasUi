@@ -110,6 +110,46 @@ async def harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.mark.asyncio
+async def test_continuous_transcript_keeps_word_order_despite_overlapping_estimated_times(harness: Harness) -> None:
+    now = datetime(2026, 7, 29, 9, 0, tzinfo=UTC)
+    async with harness.sessions() as session:
+        call = Call(yeastar_uid=str(uuid4()), started_at=now, direction=Direction.INBOUND,
+                    duration_seconds=10, has_recording=True, processing_status="completed")
+        session.add(call)
+        await session.flush()
+        recording = Recording(call_id=call.id, yeastar_recording_id=str(uuid4()), status=RecordingStatus.COMPLETED)
+        session.add(recording)
+        await session.flush()
+        transcript = Transcript(
+            call_id=call.id, recording_id=recording.id, operator_id=None,
+            idempotency_key=str(uuid4()), status=TranscriptStatus.COMPLETED,
+            model="gpt-transcribe", language="el", completed_at=now,
+            source_audio_sha256="a" * 64, is_diarized=True, is_current=True,
+            original_text="Please call tomorrow.", transcription_mode=TranscriptionMode.MONO_DIARIZATION,
+            quality_summary={"strategy": "mono-continuous-alignment-v2", "wording_review": {
+                "status": "complete", "items": [{"segment_indexes": [1], "original_text": "tomorrow.", "alternative_text": "today."}],
+            }},
+        )
+        session.add(transcript)
+        await session.flush()
+        for sequence, start, text in [(1, "2.0", "Please call"), (2, "1.5", "tomorrow.")]:
+            session.add(TranscriptSegment(
+                transcript_id=transcript.id, call_id=call.id, operator_id=None,
+                speaker_label="A", speaker_source=SpeakerSource.OPENAI_DIARIZATION,
+                start_seconds=Decimal(start), end_seconds=Decimal("4.0"), original_text=text,
+                normalized_text=text, transcription_model="gpt-transcribe", sequence_number=sequence,
+                quality_flags=["approximate_timestamps"],
+            ))
+        await session.commit()
+        call_id = call.id
+    response = await harness.client.get(f"/api/calls/{call_id}")
+    assert response.status_code == 200
+    body = response.json()
+    assert " ".join(segment["original_text"] for segment in body["transcript_segments"]) == "Please call tomorrow."
+    assert body["transcript_quality_summaries"][0]["quality_summary"]["wording_review"]["items"][0]["alternative_text"] == "today."
+
+
+@pytest.mark.asyncio
 async def test_result_and_export_speaker_scope_follow_analysis_job(harness: Harness) -> None:
     now = datetime(2026, 7, 28, 10, 0, tzinfo=UTC)
     async with harness.sessions() as session:

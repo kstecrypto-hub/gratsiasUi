@@ -1279,6 +1279,14 @@ async def call_detail(
             .order_by(TranscriptSegment.start_seconds, TranscriptSegment.sequence_number)
         )
     ).all()
+    # Text order is authoritative for continuous mono recognition. Estimated
+    # overlapping times must not reorder words when serving the call screen.
+    if (
+        len(selected_transcripts) == 1
+        and selected_transcripts[0].transcription_mode == TranscriptionMode.MONO_DIARIZATION
+        and str((selected_transcripts[0].quality_summary or {}).get("strategy", "")).startswith("mono-continuous-alignment-")
+    ):
+        segments = sorted(segments, key=lambda segment: segment.sequence_number)
     responses: list[TranscriptSegmentResponse] = []
     top_matches: list[MatchResponse] = []
     for segment in segments:

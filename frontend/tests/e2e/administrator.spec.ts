@@ -1,6 +1,83 @@
 import { expect, Page, test } from "@playwright/test";
 
-type Handler = (page: Page, request: { method: string; pathname: string; search: string; body: unknown; headers: Record<string, string> }) => Promise<{ status?: number; body?: unknown; contentType?: string } | undefined>;
+type Handler = (page: Page, request: { method: string; pathname: string; search: string; body: unknown; headers: Record<string, string> }) => Promise<{ status?: number; body?: unknown; contentType?: string; headers?: Record<string, string> } | undefined>;
+
+function silentWav(seconds = 30) {
+  const buffer = Buffer.alloc(44 + seconds * 8000 * 2);
+  buffer.write("RIFF", 0); buffer.writeUInt32LE(buffer.length - 8, 4);
+  buffer.write("WAVEfmt ", 8); buffer.writeUInt32LE(16, 16);
+  buffer.writeUInt16LE(1, 20); buffer.writeUInt16LE(1, 22);
+  buffer.writeUInt32LE(8000, 24); buffer.writeUInt32LE(16000, 28);
+  buffer.writeUInt16LE(2, 32); buffer.writeUInt16LE(16, 34);
+  buffer.write("data", 36); buffer.writeUInt32LE(buffer.length - 44, 40);
+  return buffer;
+}
+
+function recordingResponse(headers: Record<string, string>) {
+  const wav = silentWav();
+  const range = /bytes=(\d+)-(\d*)/.exec(headers.range || "");
+  const start = range ? Number(range[1]) : 0;
+  const end = range?.[2] ? Math.min(Number(range[2]), wav.length - 1) : wav.length - 1;
+  return { status: range ? 206 : 200, body: wav.subarray(start, end + 1), contentType: "audio/wav", headers: {
+    "accept-ranges": "bytes", "content-length": String(end - start + 1),
+    ...(range ? { "content-range": `bytes ${start}-${end}/${wav.length}` } : {}),
+  } };
+}
+
+test("call review filters real issues, searches Greek, compares wording and copies original text", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: {
+      writeText: async (text: string) => { document.documentElement.dataset.copiedText = text; },
+    } });
+    Object.defineProperty(HTMLMediaElement.prototype, "play", { configurable: true, value: () => Promise.resolve() });
+  });
+  await mockApi(page, async (_page, request) => {
+    if (request.pathname === "/calls/review") return { body: {
+      id: "review", transcript_id: "review-transcript", audio_available: true, confidence_status: "high",
+      transcript_segments: [
+        { id: "clean", speaker_label: "A", speaker_source: "openai_diarization", start_timestamp: 1, end_timestamp: 4, original_text: "Καλημέρα σας.", quality_flags: ["approximate_timestamps", "logprobs_unavailable"] },
+        { id: "disputed", speaker_label: "B", speaker_source: "openai_diarization", start_timestamp: 5, end_timestamp: 8, original_text: "Η πινακίδα είναι 4179.", quality_flags: ["transcription_disagreement"] },
+      ],
+      transcript_quality_summaries: [{ transcript_id: "review-transcript", quality_summary: { wording_review: {
+        status: "complete", items: [{ segment_indexes: [1], start_seconds: 5, end_seconds: 8, original_text: "4179.", alternative_text: "4189." }],
+      } } }],
+    } };
+    if (request.pathname === "/calls/review/audio") return recordingResponse(request.headers);
+  });
+  await page.goto("/calls/review");
+  await expect(page.getByRole("button", { name: "Needs review 1", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Needs review 1", exact: true }).click();
+  await expect(page.getByText("Καλημέρα σας.", { exact: true })).toHaveCount(0);
+  await page.getByRole("searchbox", { name: "Search transcript" }).fill("πινακιδα");
+  await expect(page.locator("mark")).toHaveText("πινακίδα");
+  await page.getByText("Compare wording", { exact: true }).click();
+  await expect(page.getByText("4189.", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Listen from 0:04", exact: true }).click();
+  await expect.poll(() => page.locator("audio").evaluate((element: HTMLAudioElement) => element.currentTime)).toBeCloseTo(4, 1);
+  await page.getByRole("button", { name: "Copy transcript", exact: true }).click();
+  await expect(page.getByRole("status").filter({ hasText: "Transcript copied" })).toBeVisible();
+  await expect(page.locator("html")).toHaveAttribute("data-copied-text", "Καλημέρα σας. Η πινακίδα είναι 4179.");
+  await page.getByRole("searchbox", { name: "Search transcript" }).fill("absent");
+  await expect(page.getByText("No matching passages")).toBeVisible();
+  await page.getByRole("button", { name: "Show all conversation" }).click();
+  await expect(page.getByText("Καλημέρα σας.", { exact: true })).toBeVisible();
+});
+
+test("failed recording disables timestamp actions while keeping the transcript readable", async ({ page }) => {
+  await mockApi(page, async (_page, request) => {
+    if (request.pathname === "/calls/missing-audio") return { body: {
+      id: "missing-audio", audio_available: true, processing_status: "completed_with_errors",
+      transcript_segments: [{ id: "word", speaker_label: "Unknown", start_timestamp: 1, end_timestamp: 2, original_text: "Readable transcript." }],
+    } };
+    if (request.pathname === "/calls/missing-audio/audio") return { status: 404, body: { detail: "Audio missing" } };
+  });
+  await page.goto("/calls/missing-audio");
+  await expect(page.getByText("Readable transcript.", { exact: true })).toBeVisible();
+  await expect(page.getByText("Completed With Errors", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Retry processing" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Play segment from 0:01" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Listen with context" })).toBeDisabled();
+});
 
 test("retranscription queues the displayed transcript and opens its processing job", async ({ page }) => {
   let submitted: unknown;
@@ -72,7 +149,7 @@ async function mockApi(page: Page, handler?: Handler) {
     try { body = request.postDataJSON(); } catch { body = request.postData(); }
     const custom = await handler?.(page, { method, pathname: url.pathname.replace(/^\/api/, ""), search: url.search, body, headers: request.headers() });
     if (custom) {
-      await route.fulfill({ status: custom.status || 200, contentType: custom.contentType || "application/json", body: custom.contentType === "text/csv" ? String(custom.body || "") : JSON.stringify(custom.body ?? {}) });
+      await route.fulfill({ status: custom.status || 200, headers: custom.headers, contentType: custom.contentType || "application/json", body: Buffer.isBuffer(custom.body) ? custom.body : custom.contentType === "text/csv" ? String(custom.body || "") : JSON.stringify(custom.body ?? {}) });
       return;
     }
     const defaults: Record<string, unknown> = {
@@ -738,7 +815,7 @@ test("call detail accepts backend aliases, highlights matches, and seeks authent
       processing_history: [],
       } };
     }
-    if (request.method === "GET" && request.pathname === "/calls/call-1/audio") return { body: "", contentType: "audio/mpeg" };
+    if (request.method === "GET" && request.pathname === "/calls/call-1/audio") return recordingResponse(request.headers);
   });
   await page.goto("/calls/call-1?job_id=job-current&transcript_query=refund");
   await expect.poll(() => callDetailJobId).toBe("job-current");

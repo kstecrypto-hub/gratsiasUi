@@ -16,11 +16,13 @@ export function useRecordingPlayer() {
 
 type Source = { label: string; url: string };
 
-export function RecordingPlayer({ audioRef, src, sources, errorMessage }: {
+export function RecordingPlayer({ audioRef, src, sources, errorMessage, onPositionChange, onAvailabilityChange }: {
   audioRef: RefObject<HTMLAudioElement | null>;
   src: string;
   sources?: Source[];
   errorMessage?: string;
+  onPositionChange?: (seconds: number) => void;
+  onAvailabilityChange?: (available: boolean) => void;
 }) {
   const [selected, setSelected] = useState(src);
   const [position, setPosition] = useState(0);
@@ -52,7 +54,10 @@ export function RecordingPlayer({ audioRef, src, sources, errorMessage }: {
         aria-pressed={source.url === activeSrc} onClick={() => switchSource(source.url)}>{source.label}</button>)}
     </div> : null}
     <audio ref={audioRef} className="audio-player" controls preload="metadata" src={activeSrc}
-      onTimeUpdate={(event) => setPosition(event.currentTarget.currentTime)}
+      onTimeUpdate={(event) => {
+        setPosition(event.currentTarget.currentTime);
+        onPositionChange?.(event.currentTarget.currentTime);
+      }}
       onLoadedMetadata={(event) => {
         const audio = event.currentTarget;
         audio.playbackRate = speed;
@@ -63,8 +68,12 @@ export function RecordingPlayer({ audioRef, src, sources, errorMessage }: {
         }
         setPosition(audio.currentTime);
         setError("");
+        onAvailabilityChange?.(true);
       }}
-      onError={() => setError(errorMessage || "The recording could not be played. Check your session and the local audio file.")}>
+      onError={() => {
+        setError(errorMessage || "The recording could not be played. Check your session and the local audio file.");
+        onAvailabilityChange?.(false);
+      }}>
       Your browser does not support audio playback.
     </audio>
     <div className="page-actions audio-controls">
