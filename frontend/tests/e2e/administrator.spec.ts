@@ -2,6 +2,61 @@ import { expect, Page, test } from "@playwright/test";
 
 type Handler = (page: Page, request: { method: string; pathname: string; search: string; body: unknown; headers: Record<string, string> }) => Promise<{ status?: number; body?: unknown; contentType?: string } | undefined>;
 
+test("retranscription queues the displayed transcript and opens its processing job", async ({ page }) => {
+  let submitted: unknown;
+  await mockApi(page, async (_page, request) => {
+    if (request.pathname === "/features") return { body: { transcription_v2_enabled: true } };
+    if (request.pathname === "/calls/call-quality") return { body: {
+      id: "call-quality", transcript_id: "transcript-old", processing_status: "completed",
+      transcript_segments: [], matches: [],
+    } };
+    if (request.pathname === "/calls/call-quality/reprocess") {
+      expect(request.method).toBe("POST");
+      expect(request.headers["x-csrf-token"]).toBe("test-csrf");
+      submitted = request.body;
+      return { status: 202, body: { id: "quality-job", status: "queued" } };
+    }
+    if (request.pathname === "/jobs/quality-job") return { body: {
+      id: "quality-job", status: "queued", selected_operator_ids: [], items: [],
+    } };
+  });
+  await page.goto("/calls/call-quality");
+  await page.getByRole("button", { name: "Retranscribe audio" }).click();
+  await expect(page).toHaveURL(/\/processing\/quality-job$/);
+  expect(submitted).toEqual({ transcript_id: "transcript-old", pipeline_version: "pipeline-v2" });
+});
+
+test("retranscription keeps the transcript visible when an active job blocks it", async ({ page }) => {
+  await mockApi(page, async (_page, request) => {
+    if (request.pathname === "/features") return { body: { transcription_v2_enabled: true } };
+    if (request.pathname === "/calls/call-quality") return { body: {
+      id: "call-quality", transcript_id: "transcript-old", processing_status: "completed",
+      transcript_segments: [], matches: [],
+    } };
+    if (request.pathname === "/calls/call-quality/reprocess") return {
+      status: 409, body: { detail: "Another analysis is already active." },
+    };
+  });
+  await page.goto("/calls/call-quality");
+  await page.getByRole("button", { name: "Retranscribe audio" }).click();
+  await expect(page.getByRole("alert").filter({ hasText: "Another analysis is already active." })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Retranscribe audio" })).toBeEnabled();
+  await expect(page).toHaveURL(/\/calls\/call-quality$/);
+});
+
+test("retranscription stays hidden when the upgraded pipeline is disabled", async ({ page }) => {
+  await mockApi(page, async (_page, request) => {
+    if (request.pathname === "/features") return { body: { transcription_v2_enabled: false } };
+    if (request.pathname === "/calls/call-quality") return { body: {
+      id: "call-quality", transcript_id: "transcript-old", processing_status: "completed",
+      transcript_segments: [], matches: [],
+    } };
+  });
+  await page.goto("/calls/call-quality");
+  await expect(page.getByRole("heading", { name: "Transcript", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Retranscribe audio" })).toHaveCount(0);
+});
+
 async function mockApi(page: Page, handler?: Handler) {
   await page.route("**/api/**", async (route) => {
     const request = route.request();

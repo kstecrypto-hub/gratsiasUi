@@ -982,6 +982,29 @@ async def _upsert_details(
         leg.yeastar_leg_id: leg
         for leg in (await session.scalars(select(CallLeg).where(CallLeg.call_id == call.id))).all()
     }
+    # PBX rediscovery can prepend legs or reorder an existing timeline. Move
+    # persisted ordinals out of the final range before assigning the new order;
+    # otherwise even swapping two legs violates the immediate unique index.
+    # Keep omitted legs (and their participant/transcript references) intact.
+    incoming_ids = list(dict.fromkeys(raw["yeastar_leg_id"] for raw in interpreted_legs))
+    retained_legs = sorted(existing_legs.values(), key=lambda leg: leg.sequence_number)
+    ordered_ids = incoming_ids + [
+        leg.yeastar_leg_id for leg in retained_legs if leg.yeastar_leg_id not in incoming_ids
+    ]
+    sequence_by_id = {leg_id: index for index, leg_id in enumerate(ordered_ids, start=1)}
+    if any(
+        leg.sequence_number != sequence_by_id[leg.yeastar_leg_id] for leg in retained_legs
+    ):
+        temporary_start = max(
+            len(ordered_ids),
+            max((leg.sequence_number for leg in retained_legs), default=0),
+        ) + 1
+        for index, leg in enumerate(retained_legs):
+            leg.sequence_number = temporary_start + index
+        await session.flush()
+        for leg in retained_legs:
+            leg.sequence_number = sequence_by_id[leg.yeastar_leg_id]
+        await session.flush()
     legs_by_provider_id: dict[str, CallLeg] = {}
     for raw in interpreted_legs:
         leg = existing_legs.get(raw["yeastar_leg_id"])
@@ -989,11 +1012,11 @@ async def _upsert_details(
             leg = CallLeg(
                 call_id=call.id,
                 yeastar_leg_id=raw["yeastar_leg_id"],
-                sequence_number=raw["sequence_number"],
+                sequence_number=sequence_by_id[raw["yeastar_leg_id"]],
             )
             session.add(leg)
+            existing_legs[leg.yeastar_leg_id] = leg
         for key in (
-            "sequence_number",
             "transaction_id",
             "yeastar_cdr_id",
             "provider_leg",

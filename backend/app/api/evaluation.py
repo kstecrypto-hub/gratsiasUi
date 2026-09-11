@@ -29,7 +29,10 @@ router = APIRouter(prefix="/evaluation", tags=["evaluation"],
 
 @features_router.get("/features")
 def features(user: CurrentUser, settings: Annotated[Settings, Depends(get_settings)]):
-    return {"evaluation_ui_enabled": settings.EVALUATION_UI_ENABLED}
+    return {
+        "evaluation_ui_enabled": settings.EVALUATION_UI_ENABLED,
+        "transcription_v2_enabled": settings.TRANSCRIPTION_PIPELINE_V2_ENABLED,
+    }
 
 
 @router.get("")

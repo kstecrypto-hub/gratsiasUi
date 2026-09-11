@@ -58,6 +58,7 @@ def test_default_policy_is_immutable_json_safe_and_exact() -> None:
     assert policy.coalesce_max_gap_seconds == 0.4
     assert policy.max_coalesced_span_seconds == 45.0
     assert policy.extraction_padding_seconds == 0.2
+    assert policy.pause_padding_seconds == 0.8
     assert policy.max_refinement_spans == 120
     assert policy.global_context_max_characters == 500
     assert policy.degraded_duration_ratio_threshold == 0.20
@@ -69,6 +70,25 @@ def test_default_policy_is_immutable_json_safe_and_exact() -> None:
 
     with pytest.raises(FrozenInstanceError):
         policy.max_refinement_spans = 121  # type: ignore[misc]
+
+
+@pytest.mark.parametrize("next_start,expected_end", [
+    (8.0, 3.8),  # Long pause retains the final syllable of a number or name.
+    (3.8, 3.4),  # Extra padding stops halfway to the next speaker.
+    (3.0, 3.2),  # Rapid turns retain the existing conservative crop.
+    (2.5, 3.2),  # Overlapping speakers do not cause a larger crop.
+])
+def test_pause_padding_preserves_endings_without_extending_into_next_turn(next_start, expected_end):
+    bounds = padded_sample_bounds(_span(1.0, 3.0), following_speech_start_seconds=next_start)
+    assert bounds.extraction_start_seconds == 0.8
+    assert bounds.extraction_end_seconds == pytest.approx(expected_end)
+    assert bounds.authoritative_start_seconds == 1.0
+    assert bounds.authoritative_end_seconds == 3.0
+
+
+def test_pause_padding_remains_inside_recording():
+    bounds = padded_sample_bounds(_span(8.0, 9.9), following_speech_start_seconds=10.0)
+    assert bounds.end_sample == 160_000
 
 
 @pytest.mark.parametrize(

@@ -8,7 +8,7 @@ from numbers import Real
 from typing import Final
 
 
-MONO_REFINEMENT_POLICY_VERSION: Final = "v2-mono-two-pass-policy-v1"
+MONO_REFINEMENT_POLICY_VERSION: Final = "v2-mono-two-pass-policy-v2"
 ANONYMOUS_SPEAKER_LABEL_PATTERN: Final = r"^[A-Z]$"
 _SAMPLE_BOUNDARY_EPSILON_SECONDS: Final = 1e-9
 _ANONYMOUS_SPEAKER_LABEL = re.compile(ANONYMOUS_SPEAKER_LABEL_PATTERN, re.ASCII)
@@ -46,6 +46,7 @@ class MonoRefinementPolicy:
     coalesce_max_gap_seconds: float = 0.4
     max_coalesced_span_seconds: float = 45.0
     extraction_padding_seconds: float = 0.2
+    pause_padding_seconds: float = 0.8
     max_refinement_spans: int = 120
     global_context_max_characters: int = 500
     degraded_duration_ratio_threshold: float = 0.20
@@ -59,6 +60,7 @@ class MonoRefinementPolicy:
             ("coalesce_max_gap_seconds", self.coalesce_max_gap_seconds, True),
             ("max_coalesced_span_seconds", self.max_coalesced_span_seconds, False),
             ("extraction_padding_seconds", self.extraction_padding_seconds, True),
+            ("pause_padding_seconds", self.pause_padding_seconds, True),
         ):
             result = _finite_float(value, name=name)
             if result < 0 or (not allow_zero and result == 0):
@@ -99,6 +101,8 @@ class MonoRefinementPolicy:
             },
             "extraction": {
                 "padding_seconds": self.extraction_padding_seconds,
+                "pause_padding_seconds": self.pause_padding_seconds,
+                "pause_padding_limit": "half-gap-to-next-turn",
                 "sample_rate_hz": self.sample_rate_hz,
             },
             "refinement": {
@@ -308,9 +312,24 @@ class PaddedSampleBounds:
 def padded_sample_bounds(
     span: MonoRefinementSpan,
     policy: MonoRefinementPolicy = DEFAULT_MONO_REFINEMENT_POLICY,
+    *,
+    following_speech_start_seconds: float | None = None,
 ) -> PaddedSampleBounds:
     """Convert padded seconds to bounded, lossless 16 kHz sample coordinates."""
 
+    end_padding = policy.extraction_padding_seconds
+    if following_speech_start_seconds is not None:
+        following_start = _finite_float(
+            following_speech_start_seconds, name="Following speech start",
+        )
+        if not 0 <= following_start <= span.recording_duration_seconds:
+            raise ValueError("Following speech start must remain inside the recording.")
+        # Diarization may end a turn before the final syllable. Use a little
+        # more of an available pause without expanding into the next turn.
+        # Keep the original small pad when speakers overlap or switch rapidly.
+        end_padding = max(end_padding, min(
+            policy.pause_padding_seconds, (following_start - span.end_seconds) / 2,
+        ))
     sample_epsilon = _SAMPLE_BOUNDARY_EPSILON_SECONDS * policy.sample_rate_hz
     recording_sample_count = math.floor(
         span.recording_duration_seconds * policy.sample_rate_hz
@@ -329,7 +348,7 @@ def padded_sample_bounds(
     end_sample = min(
         recording_sample_count,
         math.ceil(
-            (span.end_seconds + policy.extraction_padding_seconds)
+            (span.end_seconds + end_padding)
             * policy.sample_rate_hz
             - sample_epsilon
         ),

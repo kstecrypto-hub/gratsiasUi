@@ -257,6 +257,39 @@ so vocabulary guidance is not sent on that path. The request formats follow
 OpenAI's official [Audio API transcription
 reference](https://platform.openai.com/docs/api-reference/audio/createTranscription).
 
+For Greek call transcription with contextual refinement, enable the existing V2
+pipeline in your local `.env`:
+
+```env
+TRANSCRIPTION_PIPELINE_V2_ENABLED=true
+TRANSCRIPTION_PIPELINE_DEFAULT=pipeline-v2
+OPENAI_TRANSCRIPTION_MODEL=gpt-transcribe
+OPENAI_DIARIZATION_MODEL=gpt-4o-transcribe-diarize
+TRANSCRIPTION_LANGUAGE=el
+```
+
+Recreate the backend and worker with the same Compose project and files used to
+launch your installation. V2 first identifies speaker turns in mono recordings,
+then transcribes their audio with Greek instructions, configured company terms,
+and preceding conversation context. Confirmed stereo tracks are transcribed
+separately. Mono crops retain extra audio at pauses to avoid clipping final
+syllables; the extra padding is capped before the next speaker turn and the
+original timestamps are retained. Add accurately spelled company and service terms in **Settings →
+Company vocabulary** to help with names and specialist terminology.
+
+The GPT Transcribe adapter uses the model's plural `languages` hints. It does
+not request or invent token confidence scores, which this model does not expose.
+`gpt-4o-transcribe` remains supported for deployments requiring token confidence
+and the corresponding low-confidence audio-normalization retry. Model request
+contracts follow the official [file transcription guide](https://developers.openai.com/api/docs/guides/speech-to-text).
+
+Completed transcripts are reused during ordinary analysis. To replace one,
+open its call and select **Retranscribe audio** once other analysis has finished.
+This creates an API-billed V2 job, downloads the original recording again if
+needed, and retains the prior transcript in history. The replacement becomes
+current only after processing succeeds. Audio already removed from the PBX
+cannot be recovered by changing models.
+
 ## 7. Database migrations
 
 The `migrate` service runs `alembic upgrade head` before the backend and worker

@@ -545,6 +545,11 @@ class TranscriptionOrchestrator:
                     bounds = padded_sample_bounds(
                         span,
                         self.mono_refinement_policy,
+                        following_speech_start_seconds=(
+                            spans[span_index + 1].start_seconds
+                            if span_index + 1 < len(spans)
+                            else recording_duration
+                        ),
                     )
                     span_path = (
                         context.temporary_directory

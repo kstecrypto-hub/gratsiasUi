@@ -221,7 +221,21 @@ class OpenAITranscriptionClient:
                 raise TranscriptionError("Audio chunk exceeds the transcription upload limit.")
             with chunk.path.open("rb") as audio_file:
                 try:
-                    if logprob_contract_supported:
+                    if self.settings.OPENAI_TRANSCRIPTION_MODEL == "gpt-transcribe":
+                        # GPT Transcribe uses plural language hints and does not
+                        # expose token logprobs. Preserve the V2 upload budget
+                        # without sending unsupported legacy request fields.
+                        request_client = (
+                            client.with_options(max_retries=0) if request_logprobs else client
+                        )
+                        response = await request_client.audio.transcriptions.create(
+                            file=audio_file,
+                            model=self.settings.OPENAI_TRANSCRIPTION_MODEL,
+                            prompt=prompt or None,
+                            response_format="json",
+                            extra_body={"languages": [language]},
+                        )
+                    elif logprob_contract_supported:
                         response = await client.with_options(
                             max_retries=0
                         ).audio.transcriptions.create(

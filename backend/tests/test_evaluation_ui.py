@@ -134,7 +134,10 @@ async def test_feature_defaults_disabled_and_routes_unavailable(api_harness, dat
     assert Settings(_env_file=None).EVALUATION_UI_ENABLED is False
     await api_harness.login()
     api_harness.settings.EVALUATION_UI_ENABLED = False
-    assert (await api_harness.client.get("/api/features")).json() == {"evaluation_ui_enabled": False}
+    api_harness.settings.TRANSCRIPTION_PIPELINE_V2_ENABLED = False
+    assert (await api_harness.client.get("/api/features")).json() == {
+        "evaluation_ui_enabled": False, "transcription_v2_enabled": False,
+    }
     for endpoint in ("", "/keywords", "/eval-001", "/eval-001/audio",
                      "/eval-001/audio/channel/0", "/eval-001/audio/channel/1"):
         response = await api_harness.client.get("/api/evaluation" + endpoint)
@@ -142,6 +145,10 @@ async def test_feature_defaults_disabled_and_routes_unavailable(api_harness, dat
     assert (await save(api_harness, revision="0" * 64)).status_code == 404
     assert (await verify(api_harness, revision="0" * 64)).status_code == 404
     assert list((dataset[0] / "references").iterdir()) == []
+    api_harness.settings.TRANSCRIPTION_PIPELINE_V2_ENABLED = True
+    assert (await api_harness.client.get("/api/features")).json() == {
+        "evaluation_ui_enabled": False, "transcription_v2_enabled": True,
+    }
 
 
 async def test_evaluation_authentication_and_csrf(api_harness, dataset):

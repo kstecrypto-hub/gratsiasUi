@@ -115,6 +115,41 @@ def _request_without_file(request: Mapping[str, Any]) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("request_logprobs", [False, True])
+async def test_gpt_transcribe_uses_plural_languages_without_fabricated_confidence(
+    tmp_path: Path, request_logprobs: bool,
+) -> None:
+    provider = _ProviderClient({
+        "text": "Το αυτοκίνητο έχει επισκευαστεί.",
+        "languages": [{"code": "el"}],
+        "usage": {"type": "duration", "seconds": 10},
+    })
+    client = OpenAITranscriptionClient(
+        _settings(tmp_path, model="gpt-transcribe"),
+        client=provider,  # type: ignore[arg-type]
+    )
+    result = await client.transcribe_isolated(
+        [_audio_chunk(tmp_path)], [], language="el",
+        prompt_plan=_prompt_plan(), request_logprobs=request_logprobs,
+    )
+    assert _request_without_file(provider.requests[0]) == {
+        "model": "gpt-transcribe",
+        "prompt": "Ελληνικό τηλεφωνικό αίτημα",
+        "response_format": "json",
+        "extra_body": {"languages": ["el"]},
+    }
+    assert provider.with_options_calls == ([{"max_retries": 0}] if request_logprobs else [])
+    assert result.text == "Το αυτοκίνητο έχει επισκευαστεί."
+    assert result.usage["totals"] == {"seconds": 10}
+    if request_logprobs:
+        assert len(result.response_evidence) == 1
+        assert result.response_evidence[0].logprobs_available is False
+        assert result.response_evidence[0].token_logprobs == ()
+    else:
+        assert result.response_evidence == ()
+
+
+@pytest.mark.asyncio
 async def test_v2_client_uses_exact_logprob_request_and_parses_sdk_evidence(
     tmp_path: Path,
 ) -> None:

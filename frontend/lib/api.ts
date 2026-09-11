@@ -129,7 +129,7 @@ async function mutate<T>(path: string, method: "POST" | "PUT" | "PATCH" | "DELET
 }
 
 export const api = {
-  features: () => request<{ evaluation_ui_enabled: boolean }>("/features"),
+  features: () => request<{ evaluation_ui_enabled: boolean; transcription_v2_enabled?: boolean }>("/features"),
   evaluation: {
     list: (filter: EvaluationFilter = "all") => request<EvaluationList>(`/evaluation?filter=${filter}`),
     get: (id: string) => request<EvaluationDetail>(`/evaluation/${encodeURIComponent(id)}`),
@@ -282,6 +282,11 @@ export const api = {
       return normalizeCall(await request<CallDetail>(`/calls/${encodeURIComponent(id)}${query}`));
     },
     retry: (id: string | number) => mutate<{ message: string }>(`/calls/${encodeURIComponent(id)}/retry`, "POST"),
+    reprocess: (id: string | number, transcriptId: string | number) =>
+      mutate<ProcessingJob>(`/calls/${encodeURIComponent(id)}/reprocess`, "POST", {
+        transcript_id: transcriptId,
+        pipeline_version: "pipeline-v2",
+      }),
     assignSpeaker: (id: string | number, input: SpeakerAssignmentInput) =>
       mutate<SpeakerAssignmentResult>(`/calls/${encodeURIComponent(id)}/speaker-assignment`, "PATCH", input),
     audioUrl: (id: string | number) => apiUrl(`/calls/${encodeURIComponent(id)}/audio`),

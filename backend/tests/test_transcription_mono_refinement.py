@@ -279,7 +279,7 @@ async def test_two_pass_mono_keeps_pass1_placement_and_uses_pass2_evidence(
     assert client.pass1_requests[0].end_seconds == 60
     assert processor.extracted_ranges == [
         (12_800, 83_200),
-        (78_400, 115_200),
+        (78_400, 124_800),
     ]
     assert [
         (
@@ -484,4 +484,3 @@ async def test_cancellation_between_mono_spans_preserves_pass1_and_attempt_audit
     assert "pass1_diarization" in raised.value.usage
     assert raised.value.quality_summary is not None
     assert raised.value.quality_summary["pass1_completed"] is True
-
